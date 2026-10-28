@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "glyph-desktop"
+version = "0.1.0"
+description = "A local-first desktop PDF application"
+requires-python = ">=3.10"
+dependencies = ["PySide6-Essentials>=6.5,<7"]
+
+[project.scripts]
+glyph = "glyph_desktop.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+glyph_desktop = ["assets/*"]
