@@ -2,9 +2,10 @@
 
 from PySide6.QtCore import QEvent, Qt
 from PySide6.QtGui import QAction, QActionGroup, QKeySequence
-from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QLabel, QLineEdit,
-                               QMainWindow, QMessageBox, QStackedWidget, QTextEdit,
-                               QPlainTextEdit, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QFileDialog,
+                               QLabel, QLineEdit, QMainWindow, QMessageBox,
+                               QStackedWidget, QTextEdit, QPlainTextEdit, QVBoxLayout,
+                               QWidget)
 
 from .about import AboutDialog
 from .branding import application_icon, logo_pixmap
@@ -27,6 +28,7 @@ class MainWindow(QMainWindow):
         self._build_welcome()
         self.reader = Reader(self.document, self)
         self.stack.addWidget(self.reader)
+        self.thumbnails_action.triggered.connect(self.reader.set_thumbnail_visible)
         self.document.changed.connect(self._document_changed)
         QApplication.instance().installEventFilter(self)
         self._document_changed()
@@ -49,6 +51,12 @@ class MainWindow(QMainWindow):
         quit_action.setShortcut(QKeySequence.StandardKey.Quit)
         quit_action.triggered.connect(self.close)
         app_menu.addAction(quit_action)
+
+        view_menu = self.menuBar().addMenu("&View")
+        self.thumbnails_action = QAction("&Thumbnails", self, checkable=True)
+        self.thumbnails_action.setChecked(True)
+        self.thumbnails_action.setEnabled(False)
+        view_menu.addAction(self.thumbnails_action)
 
         appearance = self.menuBar().addMenu("&Appearance")
         self.appearance_actions = QActionGroup(self)
@@ -99,6 +107,7 @@ class MainWindow(QMainWindow):
     def _document_changed(self):
         active = self.document.pdf is not None
         self.close_action.setEnabled(active)
+        self.thumbnails_action.setEnabled(active)
         self.stack.setCurrentWidget(self.reader if active else self.stack.widget(0))
         self.setWindowTitle(f"{self.document.path.name} — Glyph" if active else "Glyph")
 
@@ -106,12 +115,17 @@ class MainWindow(QMainWindow):
         if (event.type() == QEvent.Type.KeyPress and self.isActiveWindow() and self.document.pdf
                 and QApplication.activePopupWidget() is None):
             focus = QApplication.focusWidget()
-            if not isinstance(focus, (QLineEdit, QTextEdit, QPlainTextEdit, QComboBox)):
+            sidebar_focus = (focus is not None and
+                             (isinstance(focus, QAbstractItemView) or
+                              self.reader.thumbnail_list.isAncestorOf(focus) or
+                              self.reader.thumbnail_list.viewport().isAncestorOf(focus)))
+            if not sidebar_focus and not isinstance(focus, (QLineEdit, QTextEdit,
+                                                            QPlainTextEdit, QComboBox)):
                 keys = {Qt.Key.Key_PageUp: self.document.page - 1,
                         Qt.Key.Key_PageDown: self.document.page + 1,
                         Qt.Key.Key_Home: 0, Qt.Key.Key_End: self.document.count - 1}
                 if event.key() in keys and event.modifiers() == Qt.KeyboardModifier.NoModifier:
-                    self.document.set_page(keys[event.key()])
+                    self.reader.navigate_to_page(keys[event.key()])
                     return True
         return super().eventFilter(watched, event)
 

@@ -1,9 +1,10 @@
 # Glyph
 
 Glyph is a local-first desktop PDF application in development for Windows and Linux.
-Glyph opens local PDFs one page at a time, with page navigation and zoom. Document
-editing and password-protected PDFs are not yet supported. QtPdf is installed with
-the application dependencies.
+Glyph opens local PDFs in a continuous, vertically scrolling reader with page
+navigation, zoom, and a toggleable thumbnail sidebar. Document editing and
+password-protected PDFs are not yet supported. QtPdf is installed with the
+application dependencies.
 
 ## Development
 
