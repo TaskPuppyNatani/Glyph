@@ -7,7 +7,7 @@ name = "glyph-desktop"
 version = "0.1.0"
 description = "A local-first desktop PDF application"
 requires-python = ">=3.10"
-dependencies = ["PySide6-Essentials>=6.5,<7"]
+dependencies = ["PySide6-Essentials>=6.12,<6.13", "PySide6-Pdf>=6.12,<6.13"]
 
 [project.scripts]
 glyph = "glyph_desktop.app:main"

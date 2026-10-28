@@ -1,13 +1,16 @@
 """The M0 application window."""
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QEvent, Qt
 from PySide6.QtGui import QAction, QActionGroup, QKeySequence
-from PySide6.QtWidgets import QLabel, QMainWindow, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QLabel, QLineEdit,
+                               QMainWindow, QMessageBox, QStackedWidget, QTextEdit,
+                               QPlainTextEdit, QVBoxLayout, QWidget)
 
 from .about import AboutDialog
 from .branding import application_icon, logo_pixmap
 from .settings import Appearance
 from .theme import ThemeManager
+from .reader import Document, Reader
 
 
 class MainWindow(QMainWindow):
@@ -19,11 +22,25 @@ class MainWindow(QMainWindow):
         self.setWindowIcon(application_icon())
         self.resize(920, 640)
         self.setMinimumSize(420, 320)
+        self.document = Document(self)
         self._build_menu()
         self._build_welcome()
+        self.reader = Reader(self.document, self)
+        self.stack.addWidget(self.reader)
+        self.document.changed.connect(self._document_changed)
+        QApplication.instance().installEventFilter(self)
+        self._document_changed()
 
     def _build_menu(self) -> None:
         app_menu = self.menuBar().addMenu("&File")
+        open_action = QAction("&Open PDF…", self)
+        open_action.setShortcut(QKeySequence.StandardKey.Open)
+        open_action.triggered.connect(self.open_pdf)
+        app_menu.addAction(open_action)
+        self.close_action = QAction("&Close Document", self)
+        self.close_action.triggered.connect(self.document.close)
+        app_menu.addAction(self.close_action)
+        app_menu.addSeparator()
         about = QAction("&About Glyph", self)
         about.triggered.connect(self.show_about)
         app_menu.addAction(about)
@@ -68,7 +85,39 @@ class MainWindow(QMainWindow):
         subtitle.setWordWrap(True)
         layout.addWidget(subtitle)
         layout.addStretch()
-        self.setCentralWidget(container)
+        self.stack = QStackedWidget(self)
+        self.stack.addWidget(container)
+        self.setCentralWidget(self.stack)
+
+    def open_pdf(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Open PDF", "", "PDF files (*.pdf)")
+        if path:
+            error = self.document.open(path)
+            if error:
+                QMessageBox.warning(self, "Unable to open PDF", error)
+
+    def _document_changed(self):
+        active = self.document.pdf is not None
+        self.close_action.setEnabled(active)
+        self.stack.setCurrentWidget(self.reader if active else self.stack.widget(0))
+        self.setWindowTitle(f"{self.document.path.name} — Glyph" if active else "Glyph")
+
+    def eventFilter(self, watched, event):
+        if (event.type() == QEvent.Type.KeyPress and self.isActiveWindow() and self.document.pdf
+                and QApplication.activePopupWidget() is None):
+            focus = QApplication.focusWidget()
+            if not isinstance(focus, (QLineEdit, QTextEdit, QPlainTextEdit, QComboBox)):
+                keys = {Qt.Key.Key_PageUp: self.document.page - 1,
+                        Qt.Key.Key_PageDown: self.document.page + 1,
+                        Qt.Key.Key_Home: 0, Qt.Key.Key_End: self.document.count - 1}
+                if event.key() in keys and event.modifiers() == Qt.KeyboardModifier.NoModifier:
+                    self.document.set_page(keys[event.key()])
+                    return True
+        return super().eventFilter(watched, event)
+
+    def closeEvent(self, event):
+        self.document.close()
+        super().closeEvent(event)
 
     def show_about(self) -> None:
         AboutDialog(self.version, self).exec()
