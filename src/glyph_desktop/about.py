@@ -19,7 +19,7 @@ class AboutDialog(QDialog):
         if not logo.isNull():
             image = QLabel()
             image.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            image.setPixmap(logo.scaled(72, 72, Qt.AspectRatioMode.KeepAspectRatio,
+            image.setPixmap(logo.scaled(112, 112, Qt.AspectRatioMode.KeepAspectRatio,
                                         Qt.TransformationMode.SmoothTransformation))
             layout.addWidget(image)
         title = QLabel("Glyph")

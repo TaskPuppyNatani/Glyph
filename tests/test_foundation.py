@@ -8,8 +8,8 @@ from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QSettings, Qt
-from PySide6.QtGui import QColor, QPalette, QPixmap
+from PySide6.QtCore import QSettings, Qt, QRect, QSize
+from PySide6.QtGui import QColor, QImage, QPalette, QPixmap
 from PySide6.QtWidgets import QApplication, QLabel
 
 from glyph_desktop.about import AboutDialog
@@ -82,12 +82,21 @@ class FoundationTests(unittest.TestCase):
             self.assertTrue(image.save(str(path)))
             self.assertFalse(logo_pixmap().isNull())
 
-    def test_canonical_logo_is_packaged_unchanged(self):
+    def test_square_logo_canvas_preserves_canonical_source_pixels(self):
         from glyph_desktop.branding import logo_path
 
         original = Path(__file__).resolve().parents[1] / "assets" / "taskpuppykreations-logo.png"
-        self.assertEqual(hashlib.sha256(original.read_bytes()).digest(),
-                         hashlib.sha256(logo_path().read_bytes()).digest())
+        canonical = QPixmap(str(original)).toImage()
+        packaged = QPixmap(str(logo_path())).toImage()
+        self.assertEqual(packaged.size(), QSize(2048, 2048))
+        x = (packaged.width() - canonical.width()) // 2
+        y = (packaged.height() - canonical.height()) // 2
+        source_area = packaged.copy(QRect(x, y, canonical.width(), canonical.height()))
+        pixel_format = QImage.Format.Format_RGBA8888
+        self.assertEqual(bytes(source_area.convertToFormat(pixel_format).constBits()),
+                         bytes(canonical.convertToFormat(pixel_format).constBits()))
+        for x, y in ((0, 0), (2047, 0), (0, 2047), (2047, 2047)):
+            self.assertEqual(packaged.pixelColor(x, y).alpha(), 0)
         self.assertFalse(logo_pixmap().isNull())
 
     def test_canonical_icon_integrity_and_sizes(self):

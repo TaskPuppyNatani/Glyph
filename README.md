@@ -28,7 +28,8 @@ python -m unittest discover -s tests -v
 ```
 
 For headless Linux testing, set `QT_QPA_PLATFORM=offscreen` before running tests.
-The original branding asset is retained in `assets/`; an unchanged copy is included
-in the Python package so it is available to the application after installation.
+The original branding asset is retained in `assets/`. The packaged welcome/About
+resource uses a 2048×2048 transparent canvas with the source artwork centered and
+unchanged, so it is available to the application after installation.
 The separate canonical application icon is `assets/icon.ico`, also included unchanged
 in the package and retained for future Windows executable branding.
