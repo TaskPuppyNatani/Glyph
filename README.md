@@ -5,6 +5,8 @@ Glyph opens local PDFs in a continuous, vertically scrolling reader with page
 navigation, zoom, and a toggleable thumbnail sidebar. Document editing and
 password-protected PDFs are not yet supported. QtPdf is installed with the
 application dependencies.
+Glyph displays embedded PDF outlines as a hierarchical table of contents and
+navigates to their page and location destinations.
 
 Glyph keeps recent document paths and reading positions locally. It restores the
 last document on startup unless a PDF path is supplied as an argument. Clearing

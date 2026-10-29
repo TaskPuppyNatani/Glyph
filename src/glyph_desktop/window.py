@@ -47,7 +47,12 @@ class MainWindow(QMainWindow):
         edit.addAction(self.reader.copy_action)
         edit.addAction(self.reader.select_all_action)
         self.stack.addWidget(self.reader)
-        self.thumbnails_action.triggered.connect(self.reader.set_thumbnail_visible)
+        self.sidebar_visibility_action.triggered.connect(self.reader.set_sidebar_visible)
+        self.thumbnails_action.triggered.connect(
+            lambda _checked=False: self.reader.set_sidebar_mode("thumbnails"))
+        self.outline_action.triggered.connect(
+            lambda _checked=False: self.reader.set_sidebar_mode("outline"))
+        self.reader.sidebarStateChanged.connect(self._sync_sidebar_actions)
         self.document.changed.connect(self._document_changed)
         self.document.changed.connect(self._reading_changed)
         self.reader.page_view.verticalScrollBar().valueChanged.connect(self._reading_changed)
@@ -82,10 +87,22 @@ class MainWindow(QMainWindow):
         app_menu.addAction(quit_action)
 
         view_menu = self.menuBar().addMenu("&View")
+        self.sidebar_visibility_action = QAction("&Navigation Sidebar", self, checkable=True)
+        self.sidebar_visibility_action.setChecked(True)
+        self.sidebar_visibility_action.setEnabled(False)
+        view_menu.addAction(self.sidebar_visibility_action)
+        view_menu.addSeparator()
+        self.sidebar_mode_actions = QActionGroup(self)
+        self.sidebar_mode_actions.setExclusive(True)
         self.thumbnails_action = QAction("&Thumbnails", self, checkable=True)
         self.thumbnails_action.setChecked(True)
         self.thumbnails_action.setEnabled(False)
         view_menu.addAction(self.thumbnails_action)
+        self.sidebar_mode_actions.addAction(self.thumbnails_action)
+        self.outline_action = QAction("&Outline", self, checkable=True)
+        self.outline_action.setEnabled(False)
+        view_menu.addAction(self.outline_action)
+        self.sidebar_mode_actions.addAction(self.outline_action)
 
         appearance = self.menuBar().addMenu("&Appearance")
         self.appearance_actions = QActionGroup(self)
@@ -256,10 +273,18 @@ class MainWindow(QMainWindow):
     def _document_changed(self):
         active = self.document.pdf is not None
         self.close_action.setEnabled(active)
+        self.sidebar_visibility_action.setEnabled(active)
         self.thumbnails_action.setEnabled(active)
+        self.outline_action.setEnabled(active)
         self.find_action.setEnabled(active)
         self.stack.setCurrentWidget(self.reader if active else self.stack.widget(0))
         self.setWindowTitle(f"{self.document.path.name} — Glyph" if active else "Glyph")
+        self._sync_sidebar_actions(self.reader.sidebar_visible, self.reader.sidebar_mode)
+
+    def _sync_sidebar_actions(self, visible: bool, mode: str) -> None:
+        self.sidebar_visibility_action.setChecked(visible)
+        self.thumbnails_action.setChecked(mode == "thumbnails")
+        self.outline_action.setChecked(mode == "outline")
 
     def eventFilter(self, watched, event):
         if watched in (self.stack.widget(0), self.reader.page_view.viewport()):

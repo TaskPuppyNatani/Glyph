@@ -1,5 +1,6 @@
 """PDF document state and a virtualized, continuously scrolling page reader."""
 
+import math
 from bisect import bisect_left, bisect_right
 from pathlib import Path
 
@@ -10,12 +11,14 @@ from PySide6.QtGui import (QAction, QColor, QImage, QIntValidator, QKeySequence,
 from PySide6.QtPdf import QPdfDocument
 from PySide6.QtWidgets import (QAbstractItemView, QAbstractScrollArea, QComboBox,
                                QHBoxLayout, QLabel, QLineEdit, QListView, QPushButton,
-                               QStyledItemDelegate, QStyle, QVBoxLayout, QWidget, QApplication, QMenu)
+                               QStyledItemDelegate, QStyle, QVBoxLayout, QWidget, QApplication, QMenu,
+                               QTabWidget)
 
 from .rendering import BoundedImageCache, PageRenderController, RenderJob, make_render_job
 from .selection import TextSelection
 from .search import DocumentSearch
 from .find_bar import FindBar
+from .outline import OutlineDestination, OutlinePanel
 
 
 class Document(QObject):
@@ -545,6 +548,8 @@ class ThumbnailDelegate(QStyledItemDelegate):
 class Reader(QWidget):
     """Navigation, zoom, virtual page drawing, and lazy thumbnail coordination."""
 
+    sidebarStateChanged = Signal(bool, str)
+
     def __init__(self, document: Document, parent=None):
         super().__init__(parent)
         self.document = document
@@ -557,7 +562,8 @@ class Reader(QWidget):
         self._zoom_revision = 0
         self._view_generation = -1
         self._view_zoom = (document.mode, document.zoom)
-        self._thumb_visible = True
+        self._sidebar_visible = True
+        self._sidebar_mode = "thumbnails"
         self._render_timer = QTimer(self, singleShot=True)
         self._render_timer.setInterval(70)
         self._render_timer.timeout.connect(self._request_visible_pages)
@@ -602,11 +608,8 @@ class Reader(QWidget):
         sidebar_layout = QVBoxLayout(self.sidebar)
         sidebar_layout.setContentsMargins(4, 4, 8, 4)
         sidebar_layout.setSpacing(4)
-        heading = QLabel("Thumbnails")
-        heading.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        sidebar_layout.addWidget(heading)
         self.thumbnail_model = ThumbnailModel(self)
-        self.thumbnail_list = QListView(self.sidebar)
+        self.thumbnail_list = QListView()
         self.thumbnail_list.setAccessibleName("Page thumbnails")
         self.thumbnail_list.setModel(self.thumbnail_model)
         self.thumbnail_list.setItemDelegate(ThumbnailDelegate(self, self.thumbnail_list))
@@ -614,7 +617,19 @@ class Reader(QWidget):
         self.thumbnail_list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.thumbnail_list.setUniformItemSizes(True)
         self.thumbnail_list.setSpacing(0)
-        sidebar_layout.addWidget(self.thumbnail_list, 1)
+        thumbnails_tab = QWidget(self.sidebar)
+        thumbnails_layout = QVBoxLayout(thumbnails_tab)
+        thumbnails_layout.setContentsMargins(0, 0, 0, 0)
+        thumbnails_heading = QLabel("Thumbnails", thumbnails_tab)
+        thumbnails_heading.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        thumbnails_layout.addWidget(thumbnails_heading)
+        thumbnails_layout.addWidget(self.thumbnail_list, 1)
+        self.outline_panel = OutlinePanel(self.sidebar)
+        self.sidebar_tabs = QTabWidget(self.sidebar)
+        self.sidebar_tabs.setObjectName("navigationSidebarTabs")
+        self.sidebar_tabs.addTab(thumbnails_tab, "Thumbnails")
+        self.sidebar_tabs.addTab(self.outline_panel, "Outline")
+        sidebar_layout.addWidget(self.sidebar_tabs)
         content.addWidget(self.sidebar)
         self.page_view = ContinuousPageView(self, self)
         self.selection.changed.connect(self.page_view.viewport().update)
@@ -643,6 +658,8 @@ class Reader(QWidget):
         self.inside.clicked.connect(lambda: self.step_zoom(1))
         self.thumbnail_list.clicked.connect(lambda index: self.navigate_to_page(index.row()))
         self.thumbnail_list.verticalScrollBar().valueChanged.connect(self.schedule_render)
+        self.sidebar_tabs.currentChanged.connect(self._on_sidebar_tab_changed)
+        self.outline_panel.destinationActivated.connect(self.navigate_to_destination)
         self.page_view.currentPageChanged.connect(self._on_current_page)
         self.page_view.layoutChanged.connect(self._on_layout_changed)
         self.page_view.viewport().installEventFilter(self)
@@ -681,6 +698,7 @@ class Reader(QWidget):
 
     def _reset_document_state(self) -> None:
         self._render_timer.stop()
+        self.outline_panel.set_document(None, None)
         if self.controller:
             self.controller.close()
             self.controller = None
@@ -728,6 +746,7 @@ class Reader(QWidget):
             self._reset_document_state()
         elif self._view_generation != self.document.generation:
             self._view_generation = self.document.generation
+            self.outline_panel.set_document(self.document.pdf, self.document.generation)
             self.thumbnail_model.set_page_count(self.document.count)
             self.page_view.set_pages(self.document.page_sizes)
             self._view_zoom = (self.document.mode, self.document.zoom)
@@ -781,6 +800,57 @@ class Reader(QWidget):
         self.document.set_page(page)
         self._sync_thumbnail(page)
 
+    def navigate_to_destination(self, destination: OutlineDestination) -> bool:
+        """Navigate through the shared reader path to a validated PDF destination."""
+        if not isinstance(destination, OutlineDestination):
+            return False
+        page = destination.page
+        if (not self.document.pdf or not isinstance(page, int) or isinstance(page, bool)
+                or not 0 <= page < self.document.count
+                or destination.generation != self.document.generation):
+            return False
+
+        zoom_value = None
+        zoom = destination.zoom
+        if isinstance(zoom, (int, float)) and not isinstance(zoom, bool):
+            try:
+                candidate = float(zoom)
+            except (OverflowError, ValueError):
+                candidate = math.nan
+            if math.isfinite(candidate) and candidate > 0:
+                zoom_value = candidate
+        if zoom_value is not None:
+            self.document.set_zoom("Manual", zoom_value)
+
+        self.navigate_to_page(page)
+        location = destination.location
+        if (not isinstance(location, tuple) or len(location) != 2
+                or page >= len(self.page_view.page_rects)):
+            return True
+
+        try:
+            x, y = float(location[0]), float(location[1])
+        except (TypeError, ValueError, OverflowError):
+            return True
+        page_width, page_height = self.document.page_sizes[page]
+        if (not math.isfinite(x) or not math.isfinite(y)
+                or x < 0 or y < 0 or x > page_width or y > page_height):
+            return True
+
+        rect = self.page_view.page_rects[page]
+        content_x = rect.left() + x * rect.width() / page_width
+        content_y = rect.top() + y * rect.height() / page_height
+        viewport = self.page_view.viewport()
+        vertical = self.page_view.verticalScrollBar()
+        vertical.setValue(round(content_y - min(64, viewport.height() * 0.15)))
+
+        horizontal = self.page_view.horizontalScrollBar()
+        viewport_x = content_x - horizontal.value()
+        margin = min(48, viewport.width() * 0.1)
+        if viewport_x < margin or viewport_x > viewport.width() - margin:
+            horizontal.setValue(round(content_x - margin))
+        return True
+
     def enter_page(self) -> None:
         text = self.page.text()
         if text.isdigit() and 1 <= int(text) <= self.document.count:
@@ -806,9 +876,33 @@ class Reader(QWidget):
         return self.page_view.zoom_scale if self.document.pdf else 1.0
 
     def set_thumbnail_visible(self, visible: bool) -> None:
-        self._thumb_visible = visible
+        """Compatibility entry point for toggling the shared navigation sidebar."""
+        self.set_sidebar_visible(visible)
+
+    @property
+    def sidebar_visible(self) -> bool:
+        return self._sidebar_visible
+
+    @property
+    def sidebar_mode(self) -> str:
+        return self._sidebar_mode
+
+    def set_sidebar_visible(self, visible: bool) -> None:
+        self._sidebar_visible = bool(visible)
         self.sidebar.setVisible(visible)
         self.schedule_render()
+        self.sidebarStateChanged.emit(self._sidebar_visible, self._sidebar_mode)
+
+    def set_sidebar_mode(self, mode: str) -> None:
+        if mode not in ("thumbnails", "outline"):
+            return
+        self.set_sidebar_visible(True)
+        self.sidebar_tabs.setCurrentIndex(0 if mode == "thumbnails" else 1)
+
+    def _on_sidebar_tab_changed(self, index: int) -> None:
+        self._sidebar_mode = "outline" if index == 1 else "thumbnails"
+        self.schedule_render()
+        self.sidebarStateChanged.emit(self._sidebar_visible, self._sidebar_mode)
 
     def schedule_render(self, _value=None) -> None:
         if self.document.pdf and self.controller:
@@ -840,7 +934,7 @@ class Reader(QWidget):
             key = self._cache_key(job, self.document.generation)
             if not self.full_cache.contains(key):
                 jobs.append(job)
-        if self._thumb_visible:
+        if self._sidebar_visible and self._sidebar_mode == "thumbnails":
             for page in self._visible_thumbnail_pages():
                 job = self._thumbnail_job(page)
                 if not self.thumbnail_cache.contains(self._cache_key(job, self.document.generation)):
@@ -850,7 +944,8 @@ class Reader(QWidget):
 
     def _visible_thumbnail_pages(self) -> list[int]:
         count = self.thumbnail_model.page_count
-        if not count or not self._thumb_visible:
+        if (not count or not self._sidebar_visible
+                or self._sidebar_mode != "thumbnails"):
             return []
         first_index = self.thumbnail_list.indexAt(self.thumbnail_list.viewport().rect().topLeft())
         first = first_index.row() if first_index.isValid() else 0
