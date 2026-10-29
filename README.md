@@ -10,6 +10,9 @@ Glyph keeps recent document paths and reading positions locally. It restores the
 last document on startup unless a PDF path is supplied as an argument. Clearing
 recent documents keeps saved reading positions and the last session.
 
+Embedded PDF text can be selected and copied. Selection and Select All are
+limited to one page at a time; image-only pages have no selectable text.
+
 ## Development
 
 Python 3.10 or newer is required. Create and activate a virtual environment:

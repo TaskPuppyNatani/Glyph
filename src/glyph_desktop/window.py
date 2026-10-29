@@ -7,7 +7,7 @@ from PySide6.QtGui import QAction, QActionGroup, QKeySequence
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QFileDialog,
                                QLabel, QLineEdit, QMainWindow, QMessageBox,
                                QStackedWidget, QTextEdit, QPlainTextEdit, QVBoxLayout, QPushButton, QScrollArea,
-                               QWidget)
+                               QWidget, QMenu)
 
 from .about import AboutDialog
 from .branding import application_icon, logo_pixmap
@@ -35,6 +35,10 @@ class MainWindow(QMainWindow):
         self._build_menu()
         self._build_welcome()
         self.reader = Reader(self.document, self)
+        edit = QMenu("&Edit", self)
+        self.menuBar().insertMenu(self.menuBar().actions()[1], edit)
+        edit.addAction(self.reader.copy_action)
+        edit.addAction(self.reader.select_all_action)
         self.stack.addWidget(self.reader)
         self.thumbnails_action.triggered.connect(self.reader.set_thumbnail_visible)
         self.document.changed.connect(self._document_changed)
@@ -262,6 +266,10 @@ class MainWindow(QMainWindow):
                 return True
         if (event.type() == QEvent.Type.KeyPress and self.isActiveWindow() and self.document.pdf
                 and QApplication.activePopupWidget() is None):
+            if (event.key() == Qt.Key.Key_Escape and event.modifiers() == Qt.KeyboardModifier.NoModifier
+                    and self.reader.selection.valid()):
+                self.reader.selection.clear()
+                return True
             focus = QApplication.focusWidget()
             sidebar_focus = (focus is not None and
                              (isinstance(focus, QAbstractItemView) or

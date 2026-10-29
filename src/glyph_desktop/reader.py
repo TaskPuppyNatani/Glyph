@@ -3,16 +3,17 @@
 from bisect import bisect_left, bisect_right
 from pathlib import Path
 
-from PySide6.QtCore import (QAbstractListModel, QEvent, QModelIndex, QObject, QRectF,
+from PySide6.QtCore import (QAbstractListModel, QEvent, QModelIndex, QObject, QPointF, QRectF,
                             QSize, Qt, QTimer, Signal)
-from PySide6.QtGui import (QColor, QImage, QIntValidator, QPainter, QPen, QPixmap,
+from PySide6.QtGui import (QAction, QColor, QImage, QIntValidator, QKeySequence, QPainter, QPen, QPixmap, QTransform,
                            QPalette)
 from PySide6.QtPdf import QPdfDocument
 from PySide6.QtWidgets import (QAbstractItemView, QAbstractScrollArea, QComboBox,
                                QHBoxLayout, QLabel, QLineEdit, QListView, QPushButton,
-                               QStyledItemDelegate, QStyle, QVBoxLayout, QWidget)
+                               QStyledItemDelegate, QStyle, QVBoxLayout, QWidget, QApplication, QMenu)
 
 from .rendering import BoundedImageCache, PageRenderController, RenderJob, make_render_job
+from .selection import TextSelection
 
 
 class Document(QObject):
@@ -157,6 +158,14 @@ class ContinuousPageView(QAbstractScrollArea):
         self.total_height = 0
         self.zoom_scale = 1.0
         self._laying_out = False
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.viewport().setMouseTracking(True)
+        self._drag_page = None
+        self._drag_start = None
+        self._drag_end = None
+        self._drag_timer = QTimer(self, singleShot=True)
+        self._drag_timer.setInterval(16)
+        self._drag_timer.timeout.connect(self._update_drag)
         self.current_timer = QTimer(self, singleShot=True)
         self.current_timer.setInterval(90)
         self.current_timer.timeout.connect(self._emit_current_page)
@@ -179,6 +188,8 @@ class ContinuousPageView(QAbstractScrollArea):
         self._schedule_current_page()
 
     def clear_document(self) -> None:
+        self._drag_timer.stop()
+        self._drag_page = self._drag_start = self._drag_end = None
         self.current_timer.stop()
         self.page_sizes.clear()
         self.page_rects.clear()
@@ -314,6 +325,97 @@ class ContinuousPageView(QAbstractScrollArea):
         self.verticalScrollBar().setValue(round(target))
         self.currentPageChanged.emit(page)
 
+    def viewport_to_pdf(self, position, page=None, clamp=False):
+        content = QPointF(position.x() + self.horizontalScrollBar().value(),
+                          position.y() + self.verticalScrollBar().value())
+        if page is None:
+            page = bisect_right(self.page_tops, content.y()) - 1
+        if not 0 <= page < len(self.page_rects):
+            return None
+        rect = self.page_rects[page]
+        if not clamp and not rect.contains(content):
+            return None
+        x = min(max(content.x(), rect.left()), rect.right())
+        y = min(max(content.y(), rect.top()), rect.bottom())
+        width, height = self.page_sizes[page]
+        return page, QPointF((x - rect.left()) * width / rect.width(),
+                             (y - rect.top()) * height / rect.height())
+
+    def pdf_to_viewport(self, page, point):
+        rect = self.page_rects[page]
+        width, height = self.page_sizes[page]
+        return QPointF(rect.left() + point.x() * rect.width() / width - self.horizontalScrollBar().value(),
+                       rect.top() + point.y() * rect.height() / height - self.verticalScrollBar().value())
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.setFocus(Qt.FocusReason.MouseFocusReason)
+            hit = self.viewport_to_pdf(event.position())
+            self.reader.selection.clear()
+            self._drag_timer.stop()
+            self._drag_page = self._drag_start = self._drag_end = None
+            if hit and self.reader.selection.text_hit(*hit):
+                self._drag_page, self._drag_start = hit
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._drag_page is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            hit = self.viewport_to_pdf(event.position(), self._drag_page, clamp=True)
+            if hit:
+                self._drag_end = hit[1]
+                if not self._drag_timer.isActive():
+                    self._drag_timer.start()
+            event.accept()
+            return
+        hit = self.viewport_to_pdf(event.position())
+        self.viewport().setCursor(Qt.CursorShape.IBeamCursor if hit and
+                                  self.reader.selection.text_hit(*hit) else Qt.CursorShape.ArrowCursor)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._drag_page is not None:
+            hit = self.viewport_to_pdf(event.position(), self._drag_page, clamp=True)
+            if hit:
+                self._drag_end = hit[1]
+                self._drag_timer.stop()
+                self._update_drag()
+            self._drag_page = self._drag_start = self._drag_end = None
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def _update_drag(self):
+        if self._drag_page is not None and self._drag_end is not None:
+            self.reader.selection.drag(self._drag_page, self._drag_start, self._drag_end)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape and self.reader.selection.valid():
+            self.reader.selection.clear()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def selection_at(self, position):
+        selection = self.reader.selection
+        if not selection.valid():
+            return False
+        hit = self.viewport_to_pdf(position)
+        if not hit or hit[0] != selection.page:
+            return False
+        point = hit[1]
+        return any(polygon.containsPoint(point, Qt.FillRule.OddEvenFill)
+                   for polygon in selection.result.bounds())
+
+    def contextMenuEvent(self, event):
+        if self.selection_at(event.pos()):
+            menu = QMenu(self)
+            menu.addAction(self.reader.copy_action)
+            menu.exec(event.globalPos())
+            return
+        super().contextMenuEvent(event)
+
     def paintEvent(self, event) -> None:
         painter = QPainter(self.viewport())
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
@@ -334,6 +436,17 @@ class ContinuousPageView(QAbstractScrollArea):
             image = self.reader.page_image(page)
             if image is not None:
                 painter.drawImage(rect, image)
+            selection = self.reader.selection
+            if selection.valid() and selection.page == page:
+                width, height = self.page_sizes[page]
+                transform = QTransform().translate(rect.left(), rect.top()).scale(rect.width() / width, rect.height() / height)
+                color = self.palette().color(QPalette.ColorRole.Highlight)
+                color.setAlpha(115)
+                painter.setPen(QPen(color, 3))
+                painter.setBrush(color)
+                for polygon in selection.result.bounds():
+                    painter.drawPolygon(transform.map(polygon))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.setPen(QPen(QColor("#aeb4bb"), 1))
             painter.drawRect(rect.adjusted(0, 0, -1, -1))
         painter.end()
@@ -415,6 +528,7 @@ class Reader(QWidget):
     def __init__(self, document: Document, parent=None):
         super().__init__(parent)
         self.document = document
+        self.selection = TextSelection(document, self)
         self.full_cache = BoundedImageCache(8, 96 * 1024 * 1024)
         self.thumbnail_cache = BoundedImageCache(32, 8 * 1024 * 1024)
         self.controller: PageRenderController | None = None
@@ -477,6 +591,19 @@ class Reader(QWidget):
         sidebar_layout.addWidget(self.thumbnail_list, 1)
         content.addWidget(self.sidebar)
         self.page_view = ContinuousPageView(self, self)
+        self.selection.changed.connect(self.page_view.viewport().update)
+        self.copy_action = QAction("&Copy", self)
+        self.copy_action.setShortcut(QKeySequence.StandardKey.Copy)
+        self.copy_action.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self.copy_action.triggered.connect(self.copy_selection)
+        self.copy_action.setEnabled(False)
+        self.select_all_action = QAction("Select &All", self)
+        self.select_all_action.setShortcut(QKeySequence.StandardKey.SelectAll)
+        self.select_all_action.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self.select_all_action.triggered.connect(self.select_current_page)
+        self.page_view.addAction(self.copy_action)
+        self.page_view.addAction(self.select_all_action)
+        self.selection.changed.connect(lambda: self.copy_action.setEnabled(self.selection.valid()))
         content.addWidget(self.page_view, 1)
         layout.addLayout(content, 1)
 
@@ -538,8 +665,17 @@ class Reader(QWidget):
         self._view_generation = -1
         self._zoom_revision += 1
 
+    def copy_selection(self):
+        if self.selection.valid():
+            QApplication.clipboard().setText(self.selection.result.text())
+
+    def select_current_page(self):
+        if self.document.pdf:
+            self.selection.select_all(self.document.page)
+
     def update_state(self) -> None:
         active = self.document.pdf is not None
+        self.select_all_action.setEnabled(active)
         if not active:
             self._reset_document_state()
         elif self._view_generation != self.document.generation:
