@@ -14,6 +14,8 @@ from PySide6.QtWidgets import (QAbstractItemView, QAbstractScrollArea, QComboBox
 
 from .rendering import BoundedImageCache, PageRenderController, RenderJob, make_render_job
 from .selection import TextSelection
+from .search import DocumentSearch
+from .find_bar import FindBar
 
 
 class Document(QObject):
@@ -436,17 +438,35 @@ class ContinuousPageView(QAbstractScrollArea):
             image = self.reader.page_image(page)
             if image is not None:
                 painter.drawImage(rect, image)
+            search = self.reader.search
+            search_results = search.results_for_page(page)
+            active_search_result = search.active_result
             selection = self.reader.selection
-            if selection.valid() and selection.page == page:
+            selection_visible = selection.valid() and selection.page == page
+            if search_results or selection_visible:
                 width, height = self.page_sizes[page]
                 transform = QTransform().translate(rect.left(), rect.top()).scale(rect.width() / width, rect.height() / height)
-                color = self.palette().color(QPalette.ColorRole.Highlight)
-                color.setAlpha(115)
-                painter.setPen(QPen(color, 3))
-                painter.setBrush(color)
-                for polygon in selection.result.bounds():
-                    painter.drawPolygon(transform.map(polygon))
-                painter.setBrush(Qt.BrushStyle.NoBrush)
+                if search_results:
+                    painter.save()
+                    for result in search_results:
+                        if result.generation != self.reader.document.generation:
+                            continue
+                        active = result is active_search_result
+                        fill = QColor(255, 126, 0, 158) if active else QColor(255, 211, 0, 94)
+                        outline = QColor(184, 65, 0, 225) if active else QColor(158, 123, 0, 145)
+                        painter.setPen(QPen(outline, 1.5 if active else 1))
+                        painter.setBrush(fill)
+                        for polygon in result.bounds:
+                            painter.drawPolygon(transform.map(polygon))
+                    painter.restore()
+                if selection_visible:
+                    color = self.palette().color(QPalette.ColorRole.Highlight)
+                    color.setAlpha(115)
+                    painter.setPen(QPen(color, 3))
+                    painter.setBrush(color)
+                    for polygon in selection.result.bounds():
+                        painter.drawPolygon(transform.map(polygon))
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.setPen(QPen(QColor("#aeb4bb"), 1))
             painter.drawRect(rect.adjusted(0, 0, -1, -1))
         painter.end()
@@ -529,6 +549,7 @@ class Reader(QWidget):
         super().__init__(parent)
         self.document = document
         self.selection = TextSelection(document, self)
+        self.search = DocumentSearch(document, self)
         self.full_cache = BoundedImageCache(8, 96 * 1024 * 1024)
         self.thumbnail_cache = BoundedImageCache(32, 8 * 1024 * 1024)
         self.controller: PageRenderController | None = None
@@ -568,6 +589,11 @@ class Reader(QWidget):
         bar.addStretch()
         layout.addLayout(bar)
 
+        self.find_bar = FindBar(self.search, self)
+        self.find_bar.closeRequested.connect(self.close_find_bar)
+        self.find_bar.hide()
+        layout.addWidget(self.find_bar)
+
         content = QHBoxLayout()
         content.setContentsMargins(0, 0, 0, 0)
         content.setSpacing(0)
@@ -606,6 +632,8 @@ class Reader(QWidget):
         self.selection.changed.connect(lambda: self.copy_action.setEnabled(self.selection.valid()))
         content.addWidget(self.page_view, 1)
         layout.addLayout(content, 1)
+        self.search.changed.connect(self.page_view.viewport().update)
+        self.search.activeResultChanged.connect(self._navigate_to_search_result)
 
         self.previous.clicked.connect(lambda: self.navigate_to_page(document.page - 1))
         self.next.clicked.connect(lambda: self.navigate_to_page(document.page + 1))
@@ -668,6 +696,26 @@ class Reader(QWidget):
     def copy_selection(self):
         if self.selection.valid():
             QApplication.clipboard().setText(self.selection.result.text())
+
+    def show_find_bar(self) -> None:
+        if self.document.pdf:
+            self.find_bar.show_and_focus()
+
+    def close_find_bar(self) -> None:
+        self.find_bar.hide()
+        self.search.clear()
+        if self.document.pdf:
+            self.page_view.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _navigate_to_search_result(self, result) -> None:
+        if (result is None or not self.document.pdf
+                or result.generation != self.document.generation):
+            return
+        self.navigate_to_page(result.page)
+        point = self.page_view.pdf_to_viewport(result.page, result.bounding_rect.center())
+        target = (self.page_view.verticalScrollBar().value() + point.y()
+                  - self.page_view.viewport().height() / 2)
+        self.page_view.verticalScrollBar().setValue(round(target))
 
     def select_current_page(self):
         if self.document.pdf:

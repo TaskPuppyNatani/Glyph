@@ -12,6 +12,8 @@ recent documents keeps saved reading positions and the last session.
 
 Embedded PDF text can be selected and copied. Selection and Select All are
 limited to one page at a time; image-only pages have no selectable text.
+Press Ctrl+F to search the open document, move to the next or previous match,
+and view transient highlights.
 
 ## Development
 

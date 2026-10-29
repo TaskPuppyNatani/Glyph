@@ -37,6 +37,13 @@ class MainWindow(QMainWindow):
         self.reader = Reader(self.document, self)
         edit = QMenu("&Edit", self)
         self.menuBar().insertMenu(self.menuBar().actions()[1], edit)
+        self.find_action = QAction("&Find…", self)
+        self.find_action.setShortcut(QKeySequence.StandardKey.Find)
+        self.find_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        self.find_action.triggered.connect(self.reader.show_find_bar)
+        self.addAction(self.find_action)
+        edit.addAction(self.find_action)
+        edit.addSeparator()
         edit.addAction(self.reader.copy_action)
         edit.addAction(self.reader.select_all_action)
         self.stack.addWidget(self.reader)
@@ -250,6 +257,7 @@ class MainWindow(QMainWindow):
         active = self.document.pdf is not None
         self.close_action.setEnabled(active)
         self.thumbnails_action.setEnabled(active)
+        self.find_action.setEnabled(active)
         self.stack.setCurrentWidget(self.reader if active else self.stack.widget(0))
         self.setWindowTitle(f"{self.document.path.name} — Glyph" if active else "Glyph")
 
@@ -264,6 +272,13 @@ class MainWindow(QMainWindow):
             if event.type() == QEvent.Type.Drop:
                 self.dropEvent(event)
                 return True
+        if (event.type() == QEvent.Type.KeyPress and self.isActiveWindow()
+                and QApplication.activePopupWidget() is None
+                and event.key() == Qt.Key.Key_Escape
+                and event.modifiers() == Qt.KeyboardModifier.NoModifier
+                and self.reader.find_bar.isVisible()):
+            self.reader.close_find_bar()
+            return True
         if (event.type() == QEvent.Type.KeyPress and self.isActiveWindow() and self.document.pdf
                 and QApplication.activePopupWidget() is None):
             if (event.key() == Qt.Key.Key_Escape and event.modifiers() == Qt.KeyboardModifier.NoModifier
