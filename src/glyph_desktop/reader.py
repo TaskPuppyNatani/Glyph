@@ -302,6 +302,18 @@ class ContinuousPageView(QAbstractScrollArea):
             self.horizontalScrollBar().setValue(0)
             self.currentPageChanged.emit(page)
 
+    def reading_position(self):
+        return self._capture_anchor()
+
+    def restore_position(self, page: int, offset: float) -> None:
+        if not self.page_rects:
+            return
+        page = min(max(0, page), len(self.page_rects) - 1)
+        rect = self.page_rects[page]
+        target = rect.top() + rect.height() * offset - self.viewport().height() / 2
+        self.verticalScrollBar().setValue(round(target))
+        self.currentPageChanged.emit(page)
+
     def paintEvent(self, event) -> None:
         painter = QPainter(self.viewport())
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)

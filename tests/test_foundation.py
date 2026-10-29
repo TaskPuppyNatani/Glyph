@@ -115,13 +115,39 @@ class FoundationTests(unittest.TestCase):
 
         app = MagicMock()
         app.exec.return_value = 0
-        with patch("glyph_desktop.app.QApplication", return_value=app), \
+        app.arguments.return_value = ["glyph", "requested.pdf"]
+        with patch("glyph_desktop.app.sys.argv", ["glyph", "requested.pdf"]), \
+             patch("glyph_desktop.app.QApplication", return_value=app), \
              patch("glyph_desktop.app.ThemeManager"), \
-             patch("glyph_desktop.app.MainWindow"):
+             patch("glyph_desktop.app.DocumentState"), \
+             patch("glyph_desktop.app.MainWindow") as window:
             self.assertEqual(main(), 0)
+            window.return_value.startup.assert_called_once_with("requested.pdf")
         icon = app.setWindowIcon.call_args.args[0]
         self.assertFalse(icon.isNull())
         self.assertEqual(len(icon.availableSizes()), 9)
+
+    def test_startup_uses_qt_filtered_arguments(self):
+        from glyph_desktop.app import main
+
+        document = str(Path(self.tmp.name) / "計画 draft.pdf")
+        cases = (
+            (["glyph", "-platform", "offscreen"], ["glyph"], None),
+            (["glyph", "-platform", "offscreen", document],
+             ["glyph", document], document),
+        )
+        for raw_arguments, qt_arguments, expected in cases:
+            with self.subTest(raw_arguments=raw_arguments):
+                app = MagicMock()
+                app.exec.return_value = 0
+                app.arguments.return_value = qt_arguments
+                with patch("glyph_desktop.app.sys.argv", raw_arguments), \
+                     patch("glyph_desktop.app.QApplication", return_value=app), \
+                     patch("glyph_desktop.app.ThemeManager"), \
+                     patch("glyph_desktop.app.DocumentState"), \
+                     patch("glyph_desktop.app.MainWindow") as window:
+                    self.assertEqual(main(), 0)
+                    window.return_value.startup.assert_called_once_with(expected)
 
 
 if __name__ == "__main__":

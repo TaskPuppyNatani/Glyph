@@ -6,6 +6,10 @@ navigation, zoom, and a toggleable thumbnail sidebar. Document editing and
 password-protected PDFs are not yet supported. QtPdf is installed with the
 application dependencies.
 
+Glyph keeps recent document paths and reading positions locally. It restores the
+last document on startup unless a PDF path is supplied as an argument. Clearing
+recent documents keeps saved reading positions and the last session.
+
 ## Development
 
 Python 3.10 or newer is required. Create and activate a virtual environment:

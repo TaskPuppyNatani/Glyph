@@ -1,10 +1,12 @@
 """The M0 application window."""
 
-from PySide6.QtCore import QEvent, Qt
+from pathlib import Path
+
+from PySide6.QtCore import QEvent, Qt, QTimer
 from PySide6.QtGui import QAction, QActionGroup, QKeySequence
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QFileDialog,
                                QLabel, QLineEdit, QMainWindow, QMessageBox,
-                               QStackedWidget, QTextEdit, QPlainTextEdit, QVBoxLayout,
+                               QStackedWidget, QTextEdit, QPlainTextEdit, QVBoxLayout, QPushButton, QScrollArea,
                                QWidget)
 
 from .about import AboutDialog
@@ -12,13 +14,19 @@ from .branding import application_icon, logo_pixmap
 from .settings import Appearance
 from .theme import ThemeManager
 from .reader import Document, Reader
+from .document_state import DocumentState
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, theme: ThemeManager, version: str) -> None:
+    def __init__(self, theme: ThemeManager, version: str, state: DocumentState | None = None) -> None:
         super().__init__()
         self.theme = theme
         self.version = version
+        self.state = state if state is not None else DocumentState()
+        self._restoring = False
+        self._persist_timer = QTimer(self, singleShot=True)
+        self._persist_timer.setInterval(750)
+        self._persist_timer.timeout.connect(self.state.save)
         self.setWindowTitle("Glyph")
         self.setWindowIcon(application_icon())
         self.resize(920, 640)
@@ -30,8 +38,15 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.reader)
         self.thumbnails_action.triggered.connect(self.reader.set_thumbnail_visible)
         self.document.changed.connect(self._document_changed)
+        self.document.changed.connect(self._reading_changed)
+        self.reader.page_view.verticalScrollBar().valueChanged.connect(self._reading_changed)
+        for target in (self, self.stack.widget(0), self.reader.page_view.viewport()):
+            target.setAcceptDrops(True)
+            if target is not self:
+                target.installEventFilter(self)
         QApplication.instance().installEventFilter(self)
         self._document_changed()
+        self._refresh_recents()
 
     def _build_menu(self) -> None:
         app_menu = self.menuBar().addMenu("&File")
@@ -40,8 +55,11 @@ class MainWindow(QMainWindow):
         open_action.triggered.connect(self.open_pdf)
         app_menu.addAction(open_action)
         self.close_action = QAction("&Close Document", self)
-        self.close_action.triggered.connect(self.document.close)
+        self.close_action.triggered.connect(self.close_document)
         app_menu.addAction(self.close_action)
+        clear = QAction("Clear Recent Documents", self)
+        clear.triggered.connect(self.clear_recents)
+        app_menu.addAction(clear)
         app_menu.addSeparator()
         about = QAction("&About Glyph", self)
         about.triggered.connect(self.show_about)
@@ -92,6 +110,19 @@ class MainWindow(QMainWindow):
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         subtitle.setWordWrap(True)
         layout.addWidget(subtitle)
+        open_button = QPushButton("Open PDF…")
+        open_button.clicked.connect(self.open_pdf)
+        layout.addWidget(open_button, alignment=Qt.AlignmentFlag.AlignHCenter)
+        self.recent_panel = QWidget()
+        self.recent_layout = QVBoxLayout(self.recent_panel)
+        self.recent_layout.setContentsMargins(0, 0, 0, 0)
+        self.recent_scroll = QScrollArea()
+        self.recent_scroll.setWidgetResizable(True)
+        self.recent_scroll.setMinimumSize(320, 150)
+        self.recent_scroll.setMaximumSize(480, 160)
+        self.recent_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.recent_scroll.setWidget(self.recent_panel)
+        layout.addWidget(self.recent_scroll, alignment=Qt.AlignmentFlag.AlignHCenter)
         layout.addStretch()
         self.stack = QStackedWidget(self)
         self.stack.addWidget(container)
@@ -100,9 +131,116 @@ class MainWindow(QMainWindow):
     def open_pdf(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open PDF", "", "PDF files (*.pdf)")
         if path:
-            error = self.document.open(path)
-            if error:
+            self.open_document(path)
+
+    def startup(self, explicit=None):
+        path = explicit if explicit is not None else self.state.last_document
+        if path:
+            self.open_document(path, quiet=explicit is None)
+
+    def open_document(self, path, *, quiet=False, recent=False):
+        path = Path(path).expanduser().resolve(strict=False)
+        if not path.is_file():
+            if recent or (quiet and self.state.last_document):
+                self.state.remove_recent(path)
+                self.state.save()
+                self._refresh_recents()
+            if not quiet:
+                QMessageBox.warning(self, "Unable to open PDF", "The document is no longer available.")
+            return False
+        self._save_current()
+        saved = self.state.reading(path)
+        self._restoring = True
+        error = self.document.open(path)
+        if error:
+            self._restoring = False
+            if quiet:
+                self.state.remove_recent(path)
+                self.state.save()
+                self._refresh_recents()
+            else:
                 QMessageBox.warning(self, "Unable to open PDF", error)
+            return False
+        self.state.opened(path)
+        self.state.save()
+        self._refresh_recents()
+        generation = self.document.generation
+
+        def restore():
+            if generation != self.document.generation or not self.document.pdf:
+                return
+            if saved:
+                self.document.set_zoom(saved["mode"], saved["zoom"])
+                self.reader.page_view.restore_position(saved["page"], saved["offset"])
+            self._restoring = False
+            self._reading_changed()
+
+        QTimer.singleShot(0, restore)
+        return True
+
+    def _save_current(self):
+        if self.document.pdf and self.document.path and not self._restoring:
+            page, offset = self.reader.page_view.reading_position()
+            self.state.set_reading(self.document.path, {"page": page, "offset": offset,
+                                   "mode": self.document.mode, "zoom": self.document.zoom})
+
+    def _reading_changed(self, *_args):
+        if self.document.pdf and not self._restoring:
+            self._save_current()
+            self._persist_timer.start()
+
+    def close_document(self):
+        self._save_current()
+        self._persist_timer.stop()
+        self.state.save()
+        self._restoring = False
+        self.document.close()
+
+    def clear_recents(self):
+        self.state.clear_recents()
+        self.state.save()
+        self._refresh_recents()
+
+    def _refresh_recents(self):
+        while self.recent_layout.count():
+            item = self.recent_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        if self.state.recents:
+            self.recent_layout.addWidget(QLabel("Recent Documents"))
+            for path in self.state.recents:
+                label = f"{Path(path).name} — {Path(path).parent.name}"
+                button = QPushButton()
+                button.setText(button.fontMetrics().elidedText(label, Qt.TextElideMode.ElideMiddle, 285))
+                button.setToolTip(path)
+                button.clicked.connect(lambda _checked=False, p=path: self.open_document(p, recent=True))
+                self.recent_layout.addWidget(button)
+        self.recent_scroll.setVisible(bool(self.state.recents))
+
+    @staticmethod
+    def _drop_path(event):
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                if url.isLocalFile() and Path(url.toLocalFile()).suffix.lower() == ".pdf":
+                    return url.toLocalFile()
+        return None
+
+    def dragEnterEvent(self, event):
+        if self._drop_path(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        self.dragEnterEvent(event)
+
+    def dropEvent(self, event):
+        path = self._drop_path(event)
+        if path:
+            self.open_document(path)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
 
     def _document_changed(self):
         active = self.document.pdf is not None
@@ -112,6 +250,16 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"{self.document.path.name} — Glyph" if active else "Glyph")
 
     def eventFilter(self, watched, event):
+        if watched in (self.stack.widget(0), self.reader.page_view.viewport()):
+            if event.type() == QEvent.Type.DragEnter:
+                self.dragEnterEvent(event)
+                return True
+            if event.type() == QEvent.Type.DragMove:
+                self.dragMoveEvent(event)
+                return True
+            if event.type() == QEvent.Type.Drop:
+                self.dropEvent(event)
+                return True
         if (event.type() == QEvent.Type.KeyPress and self.isActiveWindow() and self.document.pdf
                 and QApplication.activePopupWidget() is None):
             focus = QApplication.focusWidget()
@@ -130,7 +278,8 @@ class MainWindow(QMainWindow):
         return super().eventFilter(watched, event)
 
     def closeEvent(self, event):
-        self.document.close()
+        self.close_document()
+        self.state.close()
         super().closeEvent(event)
 
     def show_about(self) -> None:
