@@ -6,7 +6,7 @@ from pathlib import Path
 
 from PySide6.QtCore import (QAbstractListModel, QEvent, QModelIndex, QObject, QPointF, QRectF,
                             QSize, Qt, QTimer, Signal)
-from PySide6.QtGui import (QAction, QColor, QImage, QIntValidator, QKeySequence, QPainter, QPen, QPixmap, QTransform,
+from PySide6.QtGui import (QAction, QColor, QImage, QIntValidator, QKeySequence, QPainter, QPen, QPixmap, QTransform, QPolygonF,
                            QPalette)
 from PySide6.QtPdf import QPdfDocument
 from PySide6.QtWidgets import (QAbstractItemView, QAbstractScrollArea, QComboBox,
@@ -20,6 +20,7 @@ from .search import DocumentSearch
 from .find_bar import FindBar
 from .outline import OutlineDestination, OutlinePanel
 from .links import PdfLinks
+from .annotations import Annotations
 
 
 class Document(QObject):
@@ -171,6 +172,7 @@ class ContinuousPageView(QAbstractScrollArea):
         self._drag_end = None
         self._link_press = None
         self._link_press_position = None
+        self._annotation_press = None
         self._drag_timer = QTimer(self, singleShot=True)
         self._drag_timer.setInterval(16)
         self._drag_timer.timeout.connect(self._update_drag)
@@ -197,6 +199,7 @@ class ContinuousPageView(QAbstractScrollArea):
 
     def clear_document(self) -> None:
         self._clear_link_interaction()
+        self._annotation_press = None
         self._drag_timer.stop()
         self._drag_page = self._drag_start = self._drag_end = None
         self.current_timer.stop()
@@ -381,6 +384,12 @@ class ContinuousPageView(QAbstractScrollArea):
             self._link_press = (self._link_at(event.position()) if
                                 event.modifiers() == Qt.KeyboardModifier.NoModifier else None)
             self._link_press_position = event.position() if self._link_press else None
+            annotation = (self.reader.annotations.at(*hit)
+                          if hit and not self._link_press and event.modifiers() in
+                          (Qt.KeyboardModifier.NoModifier, Qt.KeyboardModifier.AltModifier) else None)
+            self._annotation_press = ((annotation.id, annotation.generation, event.position())
+                                      if annotation else None)
+            self.reader.annotations.select(None, self.reader.document.generation)
             self.reader.selection.clear()
             self._drag_timer.stop()
             self._drag_page = self._drag_start = self._drag_end = None
@@ -391,6 +400,11 @@ class ContinuousPageView(QAbstractScrollArea):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        if (self._annotation_press is not None and
+                event.buttons() & Qt.MouseButton.LeftButton and
+                (event.position() - self._annotation_press[2]).manhattanLength()
+                >= QApplication.startDragDistance()):
+            self._annotation_press = None
         if (self._link_press_position is not None and
                 event.buttons() & Qt.MouseButton.LeftButton and
                 (event.position() - self._link_press_position).manhattanLength()
@@ -416,6 +430,8 @@ class ContinuousPageView(QAbstractScrollArea):
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            annotation_press = self._annotation_press
+            self._annotation_press = None
             target = self._link_press
             position = self._link_press_position
             self._link_press = self._link_press_position = None
@@ -426,6 +442,17 @@ class ContinuousPageView(QAbstractScrollArea):
                 self._drag_timer.stop()
                 self._drag_page = self._drag_start = self._drag_end = None
                 self.reader.links.activate(target)
+                event.accept()
+                return
+            hit = self.viewport_to_pdf(event.position())
+            annotation = self.reader.annotations.at(*hit) if hit else None
+            if (annotation_press and annotation and annotation.id == annotation_press[0]
+                    and (event.position() - annotation_press[2]).manhattanLength()
+                    < QApplication.startDragDistance()):
+                self._drag_timer.stop()
+                self._drag_page = self._drag_start = self._drag_end = None
+                self.reader.annotations.select(annotation_press[0], annotation_press[1])
+                self._set_hover_cursor(event.position())
                 event.accept()
                 return
         if event.button() == Qt.MouseButton.LeftButton and self._drag_page is not None:
@@ -445,6 +472,15 @@ class ContinuousPageView(QAbstractScrollArea):
             self.reader.selection.drag(self._drag_page, self._drag_start, self._drag_end)
 
     def keyPressEvent(self, event):
+        if event.modifiers() == Qt.KeyboardModifier.NoModifier and self.reader.annotations.selected_id:
+            if event.key() == Qt.Key.Key_Delete:
+                self.reader.annotations.delete_selected()
+                event.accept()
+                return
+            if event.key() == Qt.Key.Key_Escape:
+                self.reader.annotations.select(None, self.reader.document.generation)
+                event.accept()
+                return
         if event.key() == Qt.Key.Key_Escape and self.reader.selection.valid():
             self.reader.selection.clear()
             event.accept()
@@ -495,9 +531,29 @@ class ContinuousPageView(QAbstractScrollArea):
             active_search_result = search.active_result
             selection = self.reader.selection
             selection_visible = selection.valid() and selection.page == page
-            if search_results or selection_visible:
+            annotations = [item for item in self.reader.annotations.items
+                           if item.page == page and item.generation == self.reader.document.generation]
+            if search_results or selection_visible or annotations:
                 width, height = self.page_sizes[page]
                 transform = QTransform().translate(rect.left(), rect.top()).scale(rect.width() / width, rect.height() / height)
+                for item in annotations:
+                    painter.save()
+                    for region in item.regions:
+                        polygon = transform.map(QPolygonF([QPointF(x, y) for x, y in region]))
+                        bounds = polygon.boundingRect()
+                        if item.kind == "highlight":
+                            painter.setPen(Qt.PenStyle.NoPen)
+                            painter.setBrush(QColor(255, 220, 40, 105))
+                            painter.drawPolygon(polygon)
+                        else:
+                            painter.setPen(QPen(QColor(205, 91, 32, 220), 1.5))
+                            y = bounds.bottom() if item.kind == "underline" else bounds.center().y()
+                            painter.drawLine(QPointF(bounds.left(), y), QPointF(bounds.right(), y))
+                        if item.id == self.reader.annotations.selected_id:
+                            painter.setBrush(Qt.BrushStyle.NoBrush)
+                            painter.setPen(QPen(QColor(70, 105, 160, 200), 1, Qt.PenStyle.DashLine))
+                            painter.drawPolygon(polygon)
+                    painter.restore()
                 if search_results:
                     painter.save()
                     for result in search_results:
@@ -604,6 +660,7 @@ class Reader(QWidget):
         self.document = document
         self.links = PdfLinks(document, self.navigate_to_destination, self)
         self.selection = TextSelection(document, self)
+        self.annotations = Annotations(document, self)
         self.search = DocumentSearch(document, self)
         self.full_cache = BoundedImageCache(8, 96 * 1024 * 1024)
         self.thumbnail_cache = BoundedImageCache(32, 8 * 1024 * 1024)
@@ -683,6 +740,16 @@ class Reader(QWidget):
         content.addWidget(self.sidebar)
         self.page_view = ContinuousPageView(self, self)
         self.selection.changed.connect(self.page_view.viewport().update)
+        self.annotations.changed.connect(self.page_view.viewport().update)
+        self.markup_actions = {}
+        for kind in ("highlight", "underline", "strikeout"):
+            action = QAction(kind.title(), self)
+            action.setEnabled(False)
+            action.triggered.connect(lambda _checked=False, value=kind:
+                                     self.annotations.create(value, self.selection))
+            self.markup_actions[kind] = action
+        self.selection.changed.connect(lambda: [action.setEnabled(self.selection.valid())
+                                                for action in self.markup_actions.values()])
         self.copy_action = QAction("&Copy", self)
         self.copy_action.setShortcut(QKeySequence.StandardKey.Copy)
         self.copy_action.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)

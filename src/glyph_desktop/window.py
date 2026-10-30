@@ -46,6 +46,12 @@ class MainWindow(QMainWindow):
         edit.addSeparator()
         edit.addAction(self.reader.copy_action)
         edit.addAction(self.reader.select_all_action)
+        annotations = self.menuBar().addMenu("&Annotation")
+        annotations.addAction("Annotations are not saved").setEnabled(False)
+        annotations.addAction("Alt+click markup on links to select").setEnabled(False)
+        annotations.addSeparator()
+        for action in self.reader.markup_actions.values():
+            annotations.addAction(action)
         self.stack.addWidget(self.reader)
         self.sidebar_visibility_action.triggered.connect(self.reader.set_sidebar_visible)
         self.thumbnails_action.triggered.connect(
