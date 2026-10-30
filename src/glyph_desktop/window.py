@@ -52,6 +52,7 @@ class MainWindow(QMainWindow):
         annotations.addSeparator()
         for action in self.reader.markup_actions.values():
             annotations.addAction(action)
+        annotations.addAction(self.reader.ink_action)
         self.stack.addWidget(self.reader)
         self.sidebar_visibility_action.triggered.connect(self.reader.set_sidebar_visible)
         self.thumbnails_action.triggered.connect(

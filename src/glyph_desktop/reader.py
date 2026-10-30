@@ -152,6 +152,8 @@ class ContinuousPageView(QAbstractScrollArea):
     layoutChanged = Signal(float, float)
     layoutMargin = 24
     pageGap = 24
+    inkPointEpsilon = 0.75
+    inkMaxPoints = 2000
 
     def __init__(self, reader, parent=None):
         super().__init__(parent)
@@ -173,6 +175,11 @@ class ContinuousPageView(QAbstractScrollArea):
         self._link_press = None
         self._link_press_position = None
         self._annotation_press = None
+        self._ink_mode = False
+        self._ink_page = None
+        self._ink_generation = None
+        self._ink_points: list[tuple[float, float]] = []
+        self._ink_escape = False
         self._drag_timer = QTimer(self, singleShot=True)
         self._drag_timer.setInterval(16)
         self._drag_timer.timeout.connect(self._update_drag)
@@ -200,6 +207,8 @@ class ContinuousPageView(QAbstractScrollArea):
     def clear_document(self) -> None:
         self._clear_link_interaction()
         self._annotation_press = None
+        self.set_ink_mode(False)
+        self._ink_escape = False
         self._drag_timer.stop()
         self._drag_page = self._drag_start = self._drag_end = None
         self.current_timer.stop()
@@ -246,7 +255,7 @@ class ContinuousPageView(QAbstractScrollArea):
         return page, max(0.0, min(1.0, relative))
 
     def relayout(self, preserve_anchor: bool = True) -> None:
-        self.viewport().setCursor(Qt.CursorShape.ArrowCursor)
+        self._rest_cursor()
         if not self.page_sizes:
             self.zoom_scale = 1.0
             return
@@ -291,7 +300,7 @@ class ContinuousPageView(QAbstractScrollArea):
             self.layoutChanged.emit(old_scale, scale)
 
     def _scroll_changed(self, _value: int) -> None:
-        self.viewport().setCursor(Qt.CursorShape.ArrowCursor)
+        self._rest_cursor()
         self._link_press = None
         if not self._laying_out:
             self.viewport().update()
@@ -368,18 +377,78 @@ class ContinuousPageView(QAbstractScrollArea):
 
     def _clear_link_interaction(self):
         self._link_press = self._link_press_position = None
-        self.viewport().setCursor(Qt.CursorShape.ArrowCursor)
+        self._rest_cursor()
 
     def _set_hover_cursor(self, position):
+        if self._ink_mode:
+            self.viewport().setCursor(Qt.CursorShape.CrossCursor)
+            return
         hit = self.viewport_to_pdf(position)
         link = self._link_at(position)
         self.viewport().setCursor(Qt.CursorShape.PointingHandCursor if link else
                                   Qt.CursorShape.IBeamCursor if hit and
                                   self.reader.selection.text_hit(*hit) else Qt.CursorShape.ArrowCursor)
 
+    def _rest_cursor(self) -> None:
+        self.viewport().setCursor(Qt.CursorShape.CrossCursor if self._ink_mode
+                                  else Qt.CursorShape.ArrowCursor)
+
+    @property
+    def ink_mode(self) -> bool:
+        return self._ink_mode
+
+    @property
+    def ink_drawing(self) -> bool:
+        return self._ink_page is not None
+
+    def set_ink_mode(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        self._ink_mode = enabled
+        if not enabled:
+            self._cancel_ink_stroke()
+        self.reader.ink_action.setChecked(enabled)
+        self._rest_cursor()
+
+    def _begin_ink_stroke(self, position) -> None:
+        self._link_press = self._link_press_position = None
+        self._annotation_press = None
+        self._drag_timer.stop()
+        self._drag_page = self._drag_start = self._drag_end = None
+        hit = self.viewport_to_pdf(position)
+        if not hit:
+            return
+        self._ink_page, self._ink_generation = hit[0], self.reader.document.generation
+        self._ink_points = [(hit[1].x(), hit[1].y())]
+
+    def _append_ink_point(self, position) -> None:
+        if self._ink_page is None or len(self._ink_points) >= self.inkMaxPoints:
+            return
+        hit = self.viewport_to_pdf(position, self._ink_page, clamp=True)
+        if not hit:
+            return
+        point = (hit[1].x(), hit[1].y())
+        last = self._ink_points[-1]
+        if math.hypot(point[0] - last[0], point[1] - last[1]) < self.inkPointEpsilon:
+            return
+        self._ink_points.append(point)
+
+    def _cancel_ink_stroke(self) -> None:
+        self._ink_page = self._ink_generation = None
+        self._ink_points = []
+
+    def _finish_ink_stroke(self) -> None:
+        if (self._ink_page is not None and self._ink_generation is not None
+                and self._ink_generation == self.reader.document.generation):
+            self.reader.annotations.add_ink(self._ink_page, self._ink_points)
+        self._cancel_ink_stroke()
+
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self.setFocus(Qt.FocusReason.MouseFocusReason)
+            if self._ink_mode:
+                self._begin_ink_stroke(event.position())
+                event.accept()
+                return
             hit = self.viewport_to_pdf(event.position())
             self._link_press = (self._link_at(event.position()) if
                                 event.modifiers() == Qt.KeyboardModifier.NoModifier else None)
@@ -400,6 +469,10 @@ class ContinuousPageView(QAbstractScrollArea):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        if self._ink_page is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            self._append_ink_point(event.position())
+            event.accept()
+            return
         if (self._annotation_press is not None and
                 event.buttons() & Qt.MouseButton.LeftButton and
                 (event.position() - self._annotation_press[2]).manhattanLength()
@@ -430,6 +503,12 @@ class ContinuousPageView(QAbstractScrollArea):
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            if self._ink_page is not None:
+                self._append_ink_point(event.position())
+                self._finish_ink_stroke()
+                self._rest_cursor()
+                event.accept()
+                return
             annotation_press = self._annotation_press
             self._annotation_press = None
             target = self._link_press
@@ -472,6 +551,21 @@ class ContinuousPageView(QAbstractScrollArea):
             self.reader.selection.drag(self._drag_page, self._drag_start, self._drag_end)
 
     def keyPressEvent(self, event):
+        if (event.key() == Qt.Key.Key_Escape
+                and event.modifiers() == Qt.KeyboardModifier.NoModifier):
+            if self._ink_escape or event.isAutoRepeat():
+                event.accept()
+                return
+            if self._ink_page is not None:
+                self._ink_escape = True
+                self._cancel_ink_stroke()
+                event.accept()
+                return
+            if self._ink_mode:
+                self._ink_escape = True
+                self.set_ink_mode(False)
+                event.accept()
+                return
         if event.modifiers() == Qt.KeyboardModifier.NoModifier and self.reader.annotations.selected_id:
             if event.key() == Qt.Key.Key_Delete:
                 self.reader.annotations.delete_selected()
@@ -486,6 +580,15 @@ class ContinuousPageView(QAbstractScrollArea):
             event.accept()
             return
         super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape and not event.isAutoRepeat():
+            self._ink_escape = False
+        super().keyReleaseEvent(event)
+
+    def focusOutEvent(self, event):
+        self._ink_escape = False
+        super().focusOutEvent(event)
 
     def selection_at(self, position):
         selection = self.reader.selection
@@ -538,6 +641,25 @@ class ContinuousPageView(QAbstractScrollArea):
                 transform = QTransform().translate(rect.left(), rect.top()).scale(rect.width() / width, rect.height() / height)
                 for item in annotations:
                     painter.save()
+                    if item.kind == "ink":
+                        mapped = [transform.map(QPointF(x, y)) for x, y in item.points]
+                        pen = QPen(QColor(24, 32, 44), item.width * transform.m11())
+                        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+                        painter.setPen(pen)
+                        for start, end in zip(mapped, mapped[1:]):
+                            painter.drawLine(start, end)
+                        if item.id == self.reader.annotations.selected_id:
+                            selected = QPen(QColor(70, 105, 160, 200),
+                                            item.width * transform.m11() + 4.0,
+                                            Qt.PenStyle.DashLine)
+                            selected.setCapStyle(Qt.PenCapStyle.RoundCap)
+                            selected.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+                            painter.setPen(selected)
+                            for start, end in zip(mapped, mapped[1:]):
+                                painter.drawLine(start, end)
+                        painter.restore()
+                        continue
                     for region in item.regions:
                         polygon = transform.map(QPolygonF([QPointF(x, y) for x, y in region]))
                         bounds = polygon.boundingRect()
@@ -750,6 +872,9 @@ class Reader(QWidget):
             self.markup_actions[kind] = action
         self.selection.changed.connect(lambda: [action.setEnabled(self.selection.valid())
                                                 for action in self.markup_actions.values()])
+        self.ink_action = QAction("&Ink", self, checkable=True)
+        self.ink_action.triggered.connect(
+            lambda checked: self.page_view.set_ink_mode(checked))
         self.copy_action = QAction("&Copy", self)
         self.copy_action.setShortcut(QKeySequence.StandardKey.Copy)
         self.copy_action.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
@@ -862,6 +987,7 @@ class Reader(QWidget):
     def update_state(self) -> None:
         active = self.document.pdf is not None
         self.select_all_action.setEnabled(active)
+        self.ink_action.setEnabled(active)
         if not active:
             self._reset_document_state()
         elif self._view_generation != self.document.generation:
