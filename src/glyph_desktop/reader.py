@@ -19,6 +19,7 @@ from .selection import TextSelection
 from .search import DocumentSearch
 from .find_bar import FindBar
 from .outline import OutlineDestination, OutlinePanel
+from .links import PdfLinks
 
 
 class Document(QObject):
@@ -168,6 +169,8 @@ class ContinuousPageView(QAbstractScrollArea):
         self._drag_page = None
         self._drag_start = None
         self._drag_end = None
+        self._link_press = None
+        self._link_press_position = None
         self._drag_timer = QTimer(self, singleShot=True)
         self._drag_timer.setInterval(16)
         self._drag_timer.timeout.connect(self._update_drag)
@@ -193,6 +196,7 @@ class ContinuousPageView(QAbstractScrollArea):
         self._schedule_current_page()
 
     def clear_document(self) -> None:
+        self._clear_link_interaction()
         self._drag_timer.stop()
         self._drag_page = self._drag_start = self._drag_end = None
         self.current_timer.stop()
@@ -239,6 +243,7 @@ class ContinuousPageView(QAbstractScrollArea):
         return page, max(0.0, min(1.0, relative))
 
     def relayout(self, preserve_anchor: bool = True) -> None:
+        self.viewport().setCursor(Qt.CursorShape.ArrowCursor)
         if not self.page_sizes:
             self.zoom_scale = 1.0
             return
@@ -283,6 +288,8 @@ class ContinuousPageView(QAbstractScrollArea):
             self.layoutChanged.emit(old_scale, scale)
 
     def _scroll_changed(self, _value: int) -> None:
+        self.viewport().setCursor(Qt.CursorShape.ArrowCursor)
+        self._link_press = None
         if not self._laying_out:
             self.viewport().update()
             self._schedule_current_page()
@@ -352,10 +359,28 @@ class ContinuousPageView(QAbstractScrollArea):
         return QPointF(rect.left() + point.x() * rect.width() / width - self.horizontalScrollBar().value(),
                        rect.top() + point.y() * rect.height() / height - self.verticalScrollBar().value())
 
+    def _link_at(self, position):
+        hit = self.viewport_to_pdf(position)
+        return self.reader.links.hit(*hit) if hit else None
+
+    def _clear_link_interaction(self):
+        self._link_press = self._link_press_position = None
+        self.viewport().setCursor(Qt.CursorShape.ArrowCursor)
+
+    def _set_hover_cursor(self, position):
+        hit = self.viewport_to_pdf(position)
+        link = self._link_at(position)
+        self.viewport().setCursor(Qt.CursorShape.PointingHandCursor if link else
+                                  Qt.CursorShape.IBeamCursor if hit and
+                                  self.reader.selection.text_hit(*hit) else Qt.CursorShape.ArrowCursor)
+
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self.setFocus(Qt.FocusReason.MouseFocusReason)
             hit = self.viewport_to_pdf(event.position())
+            self._link_press = (self._link_at(event.position()) if
+                                event.modifiers() == Qt.KeyboardModifier.NoModifier else None)
+            self._link_press_position = event.position() if self._link_press else None
             self.reader.selection.clear()
             self._drag_timer.stop()
             self._drag_page = self._drag_start = self._drag_end = None
@@ -366,6 +391,13 @@ class ContinuousPageView(QAbstractScrollArea):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        if (self._link_press_position is not None and
+                event.buttons() & Qt.MouseButton.LeftButton and
+                (event.position() - self._link_press_position).manhattanLength()
+                >= QApplication.startDragDistance()):
+            self._link_press = self._link_press_position = None
+            if self._drag_page is not None:
+                self.viewport().setCursor(Qt.CursorShape.IBeamCursor)
         if self._drag_page is not None and event.buttons() & Qt.MouseButton.LeftButton:
             hit = self.viewport_to_pdf(event.position(), self._drag_page, clamp=True)
             if hit:
@@ -374,12 +406,28 @@ class ContinuousPageView(QAbstractScrollArea):
                     self._drag_timer.start()
             event.accept()
             return
-        hit = self.viewport_to_pdf(event.position())
-        self.viewport().setCursor(Qt.CursorShape.IBeamCursor if hit and
-                                  self.reader.selection.text_hit(*hit) else Qt.CursorShape.ArrowCursor)
+        if not event.buttons():
+            self._set_hover_cursor(event.position())
+        else:
+            hit = self.viewport_to_pdf(event.position())
+            self.viewport().setCursor(Qt.CursorShape.IBeamCursor if hit and
+                                      self.reader.selection.text_hit(*hit) else Qt.CursorShape.ArrowCursor)
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            target = self._link_press
+            position = self._link_press_position
+            self._link_press = self._link_press_position = None
+            if (target is not None and position is not None
+                    and event.modifiers() == Qt.KeyboardModifier.NoModifier
+                    and (event.position() - position).manhattanLength() < QApplication.startDragDistance()
+                    and target == self._link_at(event.position())):
+                self._drag_timer.stop()
+                self._drag_page = self._drag_start = self._drag_end = None
+                self.reader.links.activate(target)
+                event.accept()
+                return
         if event.button() == Qt.MouseButton.LeftButton and self._drag_page is not None:
             hit = self.viewport_to_pdf(event.position(), self._drag_page, clamp=True)
             if hit:
@@ -387,6 +435,7 @@ class ContinuousPageView(QAbstractScrollArea):
                 self._drag_timer.stop()
                 self._update_drag()
             self._drag_page = self._drag_start = self._drag_end = None
+            self._set_hover_cursor(event.position())
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -553,6 +602,7 @@ class Reader(QWidget):
     def __init__(self, document: Document, parent=None):
         super().__init__(parent)
         self.document = document
+        self.links = PdfLinks(document, self.navigate_to_destination, self)
         self.selection = TextSelection(document, self)
         self.search = DocumentSearch(document, self)
         self.full_cache = BoundedImageCache(8, 96 * 1024 * 1024)
@@ -668,6 +718,8 @@ class Reader(QWidget):
         self.update_state()
 
     def eventFilter(self, watched, event):
+        if watched is self.page_view.viewport() and event.type() == QEvent.Type.Leave:
+            self.page_view.viewport().setCursor(Qt.CursorShape.ArrowCursor)
         if (watched is self.page_view.viewport() and event.type() == QEvent.Type.Wheel
                 and self.document.pdf):
             if event.modifiers() == Qt.KeyboardModifier.ControlModifier:
@@ -698,6 +750,7 @@ class Reader(QWidget):
 
     def _reset_document_state(self) -> None:
         self._render_timer.stop()
+        self.links.attach(None)
         self.outline_panel.set_document(None, None)
         if self.controller:
             self.controller.close()
@@ -746,6 +799,7 @@ class Reader(QWidget):
             self._reset_document_state()
         elif self._view_generation != self.document.generation:
             self._view_generation = self.document.generation
+            self.links.attach(self.document.pdf)
             self.outline_panel.set_document(self.document.pdf, self.document.generation)
             self.thumbnail_model.set_page_count(self.document.count)
             self.page_view.set_pages(self.document.page_sizes)
