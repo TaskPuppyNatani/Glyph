@@ -2,6 +2,7 @@
 
 import math
 from bisect import bisect_left, bisect_right
+from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6.QtCore import (QAbstractListModel, QEvent, QModelIndex, QObject, QPointF, QRectF,
@@ -146,6 +147,16 @@ def current_page_for_viewport(page_tops: list[int], page_heights: list[int],
                key=lambda page: abs(page_tops[page] + page_heights[page] / 2 - center))
 
 
+@dataclass
+class _AnnotationMove:
+    annotation: object
+    generation: int
+    press_position: QPointF
+    start_pdf: QPointF
+    active: bool = False
+    delta: tuple[float, float] = (0.0, 0.0)
+
+
 class ContinuousPageView(QAbstractScrollArea):
     """Virtual document surface that paints only pages near the viewport."""
 
@@ -176,6 +187,7 @@ class ContinuousPageView(QAbstractScrollArea):
         self._link_press = None
         self._link_press_position = None
         self._annotation_press = None
+        self._move_gesture: _AnnotationMove | None = None
         self._ink_mode = False
         self._note_mode = False
         self._ink_page = None
@@ -207,6 +219,7 @@ class ContinuousPageView(QAbstractScrollArea):
         self._schedule_current_page()
 
     def clear_document(self) -> None:
+        self.cancel_annotation_move()
         self._clear_link_interaction()
         self._annotation_press = None
         self.set_ink_mode(False)
@@ -383,18 +396,30 @@ class ContinuousPageView(QAbstractScrollArea):
         self._rest_cursor()
 
     def _set_hover_cursor(self, position):
+        if self._move_gesture is not None and self._move_gesture.active:
+            self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
+            return
         if self._ink_mode or self._note_mode:
             self.viewport().setCursor(Qt.CursorShape.CrossCursor)
             return
         hit = self.viewport_to_pdf(position)
+        annotation = (self.reader.annotations.at(*hit, note_radius=self._note_radius())
+                      if hit else None)
+        if annotation is not None and annotation.kind in ("note", "ink"):
+            self.viewport().setCursor(Qt.CursorShape.OpenHandCursor)
+            return
         link = self._link_at(position)
         self.viewport().setCursor(Qt.CursorShape.PointingHandCursor if link else
                                   Qt.CursorShape.IBeamCursor if hit and
                                   self.reader.selection.text_hit(*hit) else Qt.CursorShape.ArrowCursor)
 
     def _rest_cursor(self) -> None:
-        self.viewport().setCursor(Qt.CursorShape.CrossCursor if self._ink_mode or self._note_mode
-                                  else Qt.CursorShape.ArrowCursor)
+        if self._move_gesture is not None and self._move_gesture.active:
+            shape = Qt.CursorShape.ClosedHandCursor
+        else:
+            shape = (Qt.CursorShape.CrossCursor if self._ink_mode or self._note_mode
+                     else Qt.CursorShape.ArrowCursor)
+        self.viewport().setCursor(shape)
 
     @property
     def ink_mode(self) -> bool:
@@ -408,12 +433,52 @@ class ContinuousPageView(QAbstractScrollArea):
     def ink_drawing(self) -> bool:
         return self._ink_page is not None
 
+    @property
+    def annotation_moving(self) -> bool:
+        return self._move_gesture is not None and self._move_gesture.active
+
+    def cancel_annotation_move(self) -> None:
+        if self._move_gesture is None:
+            return
+        self._move_gesture = None
+        self._annotation_press = None
+        self._clear_link_interaction()
+        self._drag_timer.stop()
+        self._drag_page = self._drag_start = self._drag_end = None
+        self.viewport().update()
+
+    def _update_annotation_move(self, position) -> None:
+        move = self._move_gesture
+        if move is None:
+            return
+        if move.generation != self.reader.document.generation:
+            self.cancel_annotation_move()
+            return
+        if not move.active:
+            distance = (position - move.press_position).manhattanLength()
+            if distance < QApplication.startDragDistance():
+                return
+            move.active = True
+            self._annotation_press = None
+            self._link_press = self._link_press_position = None
+            self.reader.annotations.select(move.annotation.id, move.generation)
+        self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
+        hit = self.viewport_to_pdf(position, move.annotation.page, clamp=True)
+        if hit:
+            dx = hit[1].x() - move.start_pdf.x()
+            dy = hit[1].y() - move.start_pdf.y()
+            delta = self.reader.annotations.bounded_move_delta(move.annotation, dx, dy)
+            move.delta = delta if delta is not None else (0.0, 0.0)
+        self.viewport().update()
+
     def _note_radius(self) -> float:
         """Half-edge of the fixed-size note marker converted into PDF-page units."""
         return NOTE_MARKER_SIZE / 2 / max(0.001, self.zoom_scale)
 
     def set_ink_mode(self, enabled: bool) -> None:
         enabled = bool(enabled)
+        if enabled:
+            self.cancel_annotation_move()
         if enabled and self._note_mode:
             self.set_note_mode(False)
         self._ink_mode = enabled
@@ -425,6 +490,8 @@ class ContinuousPageView(QAbstractScrollArea):
     def set_note_mode(self, enabled: bool) -> None:
         """Enter or leave Note placement mode, keeping the QAction and mode in step."""
         enabled = bool(enabled)
+        if enabled:
+            self.cancel_annotation_move()
         if enabled and self._ink_mode:
             self.set_ink_mode(False)
         self._note_mode = enabled
@@ -487,19 +554,32 @@ class ContinuousPageView(QAbstractScrollArea):
                 event.accept()
                 return
             hit = self.viewport_to_pdf(event.position())
-            self._link_press = (self._link_at(event.position()) if
-                                event.modifiers() == Qt.KeyboardModifier.NoModifier else None)
-            self._link_press_position = event.position() if self._link_press else None
             annotation = (self.reader.annotations.at(*hit, note_radius=self._note_radius())
-                          if hit and not self._link_press and event.modifiers() in
+                          if hit and event.modifiers() in
                           (Qt.KeyboardModifier.NoModifier, Qt.KeyboardModifier.AltModifier) else None)
+            movable_annotation = (annotation if annotation is not None
+                                  and annotation.kind in ("note", "ink")
+                                  and event.modifiers() == Qt.KeyboardModifier.NoModifier
+                                  else None)
+            self._link_press = (self._link_at(event.position()) if
+                                event.modifiers() == Qt.KeyboardModifier.NoModifier
+                                else None)
+            if self._link_press:
+                annotation = None
+            self._link_press_position = event.position() if self._link_press else None
             self._annotation_press = ((annotation.id, annotation.generation, event.position())
                                       if annotation else None)
+            self._move_gesture = (_AnnotationMove(movable_annotation,
+                                                  movable_annotation.generation,
+                                                  event.position(), hit[1])
+                                  if movable_annotation is not None and hit else None)
             self.reader.annotations.select(None, self.reader.document.generation)
             self.reader.selection.clear()
             self._drag_timer.stop()
             self._drag_page = self._drag_start = self._drag_end = None
-            if hit and self.reader.selection.text_hit(*hit):
+            text_drag = (hit and (movable_annotation is None or self._link_press)
+                         and self.reader.selection.text_hit(*hit))
+            if text_drag:
                 self._drag_page, self._drag_start = hit
             event.accept()
             return
@@ -508,6 +588,10 @@ class ContinuousPageView(QAbstractScrollArea):
     def mouseMoveEvent(self, event):
         if self._ink_page is not None and event.buttons() & Qt.MouseButton.LeftButton:
             self._append_ink_point(event.position())
+            event.accept()
+            return
+        if self._move_gesture is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            self._update_annotation_move(event.position())
             event.accept()
             return
         if (self._annotation_press is not None and
@@ -546,6 +630,21 @@ class ContinuousPageView(QAbstractScrollArea):
                 self._rest_cursor()
                 event.accept()
                 return
+            if self._move_gesture is not None:
+                self._update_annotation_move(event.position())
+                move = self._move_gesture
+                if move is not None and move.active:
+                    self._move_gesture = None
+                    self._annotation_press = None
+                    self._link_press = self._link_press_position = None
+                    self._drag_timer.stop()
+                    self._drag_page = self._drag_start = self._drag_end = None
+                    if move.generation == self.reader.document.generation:
+                        self.reader.annotations.move(move.annotation, *move.delta)
+                    self._set_hover_cursor(event.position())
+                    event.accept()
+                    return
+                self._move_gesture = None
             annotation_press = self._annotation_press
             self._annotation_press = None
             target = self._link_press
@@ -604,6 +703,11 @@ class ContinuousPageView(QAbstractScrollArea):
             if self._escape_latch or event.isAutoRepeat():
                 event.accept()
                 return
+            if self._move_gesture is not None:
+                self._escape_latch = True
+                self.cancel_annotation_move()
+                event.accept()
+                return
             if self._ink_page is not None:
                 self._escape_latch = True
                 self.cancel_ink_stroke()
@@ -641,6 +745,7 @@ class ContinuousPageView(QAbstractScrollArea):
 
     def focusOutEvent(self, event):
         self._escape_latch = False
+        self.cancel_annotation_move()
         super().focusOutEvent(event)
 
     def selection_at(self, position):
@@ -703,8 +808,13 @@ class ContinuousPageView(QAbstractScrollArea):
                 transform = QTransform().translate(rect.left(), rect.top()).scale(rect.width() / width, rect.height() / height)
                 for item in annotations:
                     painter.save()
+                    move = self._move_gesture
+                    dx, dy = ((move.delta if move is not None and move.active
+                               and move.generation == self.reader.document.generation
+                               and move.annotation.id == item.id else (0.0, 0.0)))
                     if item.kind == "ink":
-                        mapped = [transform.map(QPointF(x, y)) for x, y in item.points]
+                        mapped = [transform.map(QPointF(x + dx, y + dy))
+                                  for x, y in item.points]
                         pen = QPen(QColor(24, 32, 44), item.width * transform.m11())
                         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
                         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
@@ -723,7 +833,8 @@ class ContinuousPageView(QAbstractScrollArea):
                         painter.restore()
                         continue
                     if item.kind == "note":
-                        center = transform.map(QPointF(*item.anchor))
+                        center = transform.map(QPointF(item.anchor[0] + dx,
+                                                       item.anchor[1] + dy))
                         half = NOTE_MARKER_SIZE / 2
                         marker = QRectF(center.x() - half, center.y() - half,
                                         NOTE_MARKER_SIZE, NOTE_MARKER_SIZE)
@@ -1010,7 +1121,9 @@ class Reader(QWidget):
 
     def eventFilter(self, watched, event):
         if watched is self.page_view.viewport() and event.type() == QEvent.Type.Leave:
-            self.page_view.viewport().setCursor(Qt.CursorShape.ArrowCursor)
+            shape = (Qt.CursorShape.ClosedHandCursor if self.page_view.annotation_moving
+                     else Qt.CursorShape.ArrowCursor)
+            self.page_view.viewport().setCursor(shape)
         if (watched is self.page_view.viewport() and event.type() == QEvent.Type.Wheel
                 and self.document.pdf):
             if event.modifiers() == Qt.KeyboardModifier.ControlModifier:
@@ -1060,12 +1173,18 @@ class Reader(QWidget):
         if self.page_view.ink_drawing:
             self.page_view.cancel_ink_stroke()
             return False
+        if self.page_view.annotation_moving:
+            self.page_view.cancel_annotation_move()
+            return False
         return self.annotations.undo()
 
     def redo_annotation(self) -> bool:
         """Redo the newest reversed annotation mutation, or discard an unfinished stroke."""
         if self.page_view.ink_drawing:
             self.page_view.cancel_ink_stroke()
+            return False
+        if self.page_view.annotation_moving:
+            self.page_view.cancel_annotation_move()
             return False
         return self.annotations.redo()
 

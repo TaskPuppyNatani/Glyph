@@ -195,6 +195,64 @@ class Annotations(QObject):
         self.changed.emit()
         return item
 
+    def bounded_move_delta(self, item, dx, dy):
+        """Return one same-page PDF translation that keeps a Note or Ink in bounds."""
+        if (not isinstance(item, (Note, Ink)) or item.generation != self.document.generation
+                or not math.isfinite(dx) or not math.isfinite(dy)):
+            return None
+        if isinstance(item, Ink) and not item.points:
+            return None
+        geometry = (item.anchor if isinstance(item, Note) else
+                    tuple(value for point in item.points for value in point))
+        if not all(math.isfinite(value) for value in geometry):
+            return None
+        index = self._index_of(item.id)
+        if (index < 0 or self._items[index] != item
+                or not 0 <= item.page < len(self.document.page_sizes)):
+            return None
+        width, height = self.document.page_sizes[item.page]
+        if isinstance(item, Note):
+            x = min(max(item.anchor[0] + dx, 0.0), width)
+            y = min(max(item.anchor[1] + dy, 0.0), height)
+            return x - item.anchor[0], y - item.anchor[1]
+        xs = [point[0] for point in item.points]
+        ys = [point[1] for point in item.points]
+        if not math.isfinite(item.width):
+            return None
+        pad = max(0.0, item.width / 2)
+        min_x, max_x = pad - min(xs), width - pad - max(xs)
+        min_y, max_y = pad - min(ys), height - pad - max(ys)
+        if min_x > max_x or min_y > max_y:
+            return 0.0, 0.0
+        return min(max(dx, min_x), max_x), min(max(dy, min_y), max_y)
+
+    def move(self, item, dx, dy):
+        """Commit one bounded rigid movement as an ordinary immutable UPDATE."""
+        if not isinstance(item, (Note, Ink)):
+            return None
+        index = self._index_of(item.id)
+        if index < 0 or self._items[index] != item:
+            return None
+        delta = self.bounded_move_delta(item, dx, dy)
+        if delta is None or delta == (0.0, 0.0):
+            return None
+        dx, dy = delta
+        previous = self._items[index]
+        if isinstance(previous, Note):
+            updated = replace(previous, anchor=(previous.anchor[0] + dx,
+                                                previous.anchor[1] + dy))
+        elif isinstance(previous, Ink):
+            updated = replace(previous, points=tuple((x + dx, y + dy)
+                                                     for x, y in previous.points))
+        else:
+            return None
+        if updated == previous:
+            return None
+        self._items[index] = updated
+        self.history.record(UPDATE, updated, index, previous)
+        self.changed.emit()
+        return updated
+
     def at(self, page, point, note_radius=NOTE_MARKER_SIZE / 2):
         for item in reversed(self._items):
             if item.generation != self.document.generation or item.page != page:
