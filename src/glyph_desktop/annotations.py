@@ -1,4 +1,5 @@
-"""In-memory, document-scoped annotations (text markup and freehand ink) in PDF page coordinates."""
+"""In-memory, document-scoped annotations (text markup and freehand ink) in PDF page
+coordinates, with a bounded undo/redo history over their mutations."""
 
 import math
 from dataclasses import dataclass
@@ -7,6 +8,8 @@ from uuid import uuid4
 from PySide6.QtCore import QObject, Signal, Qt
 from PySide6.QtGui import QPolygonF
 from PySide6.QtCore import QPointF
+
+from .history import AnnotationHistory, CREATE, DELETE
 
 
 @dataclass(frozen=True)
@@ -64,6 +67,7 @@ class Annotations(QObject):
         self.document = document
         self._items = []
         self.selected_id = None
+        self.history = AnnotationHistory(self)
         document.aboutToChange.connect(self.clear)
 
     @property
@@ -73,7 +77,37 @@ class Annotations(QObject):
     def clear(self):
         self._items.clear()
         self.selected_id = None
+        self.history.clear()
         self.changed.emit()
+
+    def get(self, item_id):
+        """Return the current-generation annotation with this id, or None."""
+        index = self._index_of(item_id)
+        return self._items[index] if index >= 0 else None
+
+    def restore(self, index, item):
+        """Put an existing immutable record back, keeping its id and generation."""
+        if item.generation != self.document.generation:
+            return False
+        self._items.insert(max(0, min(index, len(self._items))), item)
+        return True
+
+    def remove(self, item_id):
+        """Take one current-generation record out of the store, or return None."""
+        index = self._index_of(item_id)
+        if index < 0:
+            return None
+        item = self._items.pop(index)
+        if self.selected_id == item_id:
+            self.selected_id = None
+        return item
+
+    def _index_of(self, item_id):
+        generation = self.document.generation
+        for index, item in enumerate(self._items):
+            if item.id == item_id and item.generation == generation:
+                return index
+        return -1
 
     def create(self, kind, selection):
         if kind not in ("highlight", "underline", "strikeout") or not selection.valid():
@@ -87,6 +121,7 @@ class Annotations(QObject):
         self._items.append(item)
         self.selected_id = None
         selection.clear()
+        self.history.record(CREATE, item, len(self._items) - 1)
         self.changed.emit()
         return item
 
@@ -99,6 +134,7 @@ class Annotations(QObject):
         item = Ink(uuid4().hex, "ink", page, self.document.generation, normalized, float(width))
         self._items.append(item)
         self.selected_id = None
+        self.history.record(CREATE, item, len(self._items) - 1)
         self.changed.emit()
         return item
 
@@ -122,8 +158,27 @@ class Annotations(QObject):
         self.changed.emit()
 
     def delete_selected(self):
-        selected = self.selected_id
-        self._items[:] = [item for item in self._items if not (
-            item.id == selected and item.generation == self.document.generation)]
+        """Remove the selected annotation as one reversible history entry."""
+        index = self._index_of(self.selected_id)
+        item = self._items.pop(index) if index >= 0 else None
         self.selected_id = None
+        if item is not None:
+            self.history.record(DELETE, item, index)
         self.changed.emit()
+        return item
+
+    @property
+    def can_undo(self):
+        return self.history.can_undo
+
+    @property
+    def can_redo(self):
+        return self.history.can_redo
+
+    def undo(self):
+        """Reverse the newest remembered mutation, or refuse a stale one."""
+        return self.history.undo()
+
+    def redo(self):
+        """Replay the newest reversed mutation, or refuse a stale one."""
+        return self.history.redo()

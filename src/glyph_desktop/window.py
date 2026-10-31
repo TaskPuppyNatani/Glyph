@@ -44,6 +44,13 @@ class MainWindow(QMainWindow):
         self.addAction(self.find_action)
         edit.addAction(self.find_action)
         edit.addSeparator()
+        self.undo_action = self.reader.undo_action
+        self.redo_action = self.reader.redo_action
+        edit.addAction(self.undo_action)
+        edit.addAction(self.redo_action)
+        self.addAction(self.undo_action)
+        self.addAction(self.redo_action)
+        edit.addSeparator()
         edit.addAction(self.reader.copy_action)
         edit.addAction(self.reader.select_all_action)
         annotations = self.menuBar().addMenu("&Annotation")

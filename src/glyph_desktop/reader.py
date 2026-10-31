@@ -405,7 +405,7 @@ class ContinuousPageView(QAbstractScrollArea):
         enabled = bool(enabled)
         self._ink_mode = enabled
         if not enabled:
-            self._cancel_ink_stroke()
+            self.cancel_ink_stroke()
         self.reader.ink_action.setChecked(enabled)
         self._rest_cursor()
 
@@ -432,7 +432,7 @@ class ContinuousPageView(QAbstractScrollArea):
             return
         self._ink_points.append(point)
 
-    def _cancel_ink_stroke(self) -> None:
+    def cancel_ink_stroke(self) -> None:
         self._ink_page = self._ink_generation = None
         self._ink_points = []
 
@@ -440,7 +440,7 @@ class ContinuousPageView(QAbstractScrollArea):
         if (self._ink_page is not None and self._ink_generation is not None
                 and self._ink_generation == self.reader.document.generation):
             self.reader.annotations.add_ink(self._ink_page, self._ink_points)
-        self._cancel_ink_stroke()
+        self.cancel_ink_stroke()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -551,6 +551,16 @@ class ContinuousPageView(QAbstractScrollArea):
             self.reader.selection.drag(self._drag_page, self._drag_start, self._drag_end)
 
     def keyPressEvent(self, event):
+        control = Qt.KeyboardModifier.ControlModifier
+        shift = Qt.KeyboardModifier.ShiftModifier
+        undo_redo_key = ((event.key() == Qt.Key.Key_Z
+                          and event.modifiers() in (control, control | shift))
+                         or (event.key() == Qt.Key.Key_Y and event.modifiers() == control))
+        if self._ink_page is not None and undo_redo_key:
+            # Reached when no history entry exists: Undo/Redo never commits or records a partial stroke.
+            self.cancel_ink_stroke()
+            event.accept()
+            return
         if (event.key() == Qt.Key.Key_Escape
                 and event.modifiers() == Qt.KeyboardModifier.NoModifier):
             if self._ink_escape or event.isAutoRepeat():
@@ -558,7 +568,7 @@ class ContinuousPageView(QAbstractScrollArea):
                 return
             if self._ink_page is not None:
                 self._ink_escape = True
-                self._cancel_ink_stroke()
+                self.cancel_ink_stroke()
                 event.accept()
                 return
             if self._ink_mode:
@@ -875,6 +885,17 @@ class Reader(QWidget):
         self.ink_action = QAction("&Ink", self, checkable=True)
         self.ink_action.triggered.connect(
             lambda checked: self.page_view.set_ink_mode(checked))
+        self.undo_action = QAction("&Undo", self)
+        self.undo_action.setShortcut(QKeySequence.StandardKey.Undo)
+        self.undo_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        self.undo_action.triggered.connect(self.undo_annotation)
+        self.redo_action = QAction("&Redo", self)
+        self.redo_action.setShortcuts([QKeySequence("Ctrl+Shift+Z"),
+                                       QKeySequence(QKeySequence.StandardKey.Redo)])
+        self.redo_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        self.redo_action.triggered.connect(self.redo_annotation)
+        self.annotations.changed.connect(self._sync_history_actions)
+        self._sync_history_actions()
         self.copy_action = QAction("&Copy", self)
         self.copy_action.setShortcut(QKeySequence.StandardKey.Copy)
         self.copy_action.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
@@ -955,6 +976,24 @@ class Reader(QWidget):
         self.page_view.clear_document()
         self._view_generation = -1
         self._zoom_revision += 1
+
+    def undo_annotation(self) -> bool:
+        """Undo the newest annotation mutation, or discard an unfinished stroke."""
+        if self.page_view.ink_drawing:
+            self.page_view.cancel_ink_stroke()
+            return False
+        return self.annotations.undo()
+
+    def redo_annotation(self) -> bool:
+        """Redo the newest reversed annotation mutation, or discard an unfinished stroke."""
+        if self.page_view.ink_drawing:
+            self.page_view.cancel_ink_stroke()
+            return False
+        return self.annotations.redo()
+
+    def _sync_history_actions(self) -> None:
+        self.undo_action.setEnabled(self.annotations.can_undo)
+        self.redo_action.setEnabled(self.annotations.can_redo)
 
     def copy_selection(self):
         if self.selection.valid():
