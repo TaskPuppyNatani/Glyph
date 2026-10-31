@@ -1,9 +1,10 @@
-"""Bounded, reversible annotation history for annotation mutations only (M3B1)."""
+"""Bounded, reversible annotation history for create, delete, and update mutations (M3B1/M3C)."""
 
 from dataclasses import dataclass
 
 CREATE = "create"
 DELETE = "delete"
+UPDATE = "update"
 
 # Fixed ceiling on remembered mutations; the oldest entries fall off first.
 MAX_ANNOTATION_HISTORY = 100
@@ -11,16 +12,18 @@ MAX_ANNOTATION_HISTORY = 100
 
 @dataclass(frozen=True)
 class AnnotationOperation:
-    """One reversible mutation: plain values plus an immutable annotation record.
+    """One reversible mutation: plain values plus immutable annotation records.
 
-    The record is a frozen Markup or Ink value owned by the annotation store. No
-    document, widget, viewport, selection, or model-index reference is retained.
+    The records are frozen Markup, Ink, or Note values owned by the annotation store;
+    an UPDATE carries both the before and after value. No document, widget, viewport,
+    selection, or model-index reference is retained.
     """
 
     action: str
     generation: int
     index: int
     annotation: object
+    previous: object = None
 
 
 class AnnotationHistory:
@@ -43,9 +46,10 @@ class AnnotationHistory:
     def can_redo(self) -> bool:
         return bool(self._redo)
 
-    def record(self, action: str, annotation, index: int) -> None:
+    def record(self, action: str, annotation, index: int, previous=None) -> None:
         """Remember one completed mutation; a new mutation abandons the redo branch."""
-        self._undo.append(AnnotationOperation(action, annotation.generation, index, annotation))
+        self._undo.append(AnnotationOperation(action, annotation.generation, index,
+                                              annotation, previous))
         if len(self._undo) > self.limit:
             del self._undo[:len(self._undo) - self.limit]
         self._redo.clear()
@@ -75,7 +79,13 @@ class AnnotationHistory:
             # Defense in depth: stale history must never mutate a newer document.
             return self._reject()
         annotation = operation.annotation
-        if operation.action == CREATE:
+        if operation.action == UPDATE:
+            # Reverse the recorded edit, and remember the swap in the opposite direction.
+            if not self.store.replace(operation.index, operation.previous):
+                return self._reject()
+            destination.append(AnnotationOperation(UPDATE, operation.generation, operation.index,
+                                                   operation.previous, annotation))
+        elif operation.action == CREATE:
             if self.store.remove(annotation.id) is None:
                 return self._reject()
             destination.append(AnnotationOperation(DELETE, operation.generation,

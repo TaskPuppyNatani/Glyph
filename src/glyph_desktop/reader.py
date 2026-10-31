@@ -9,7 +9,7 @@ from PySide6.QtCore import (QAbstractListModel, QEvent, QModelIndex, QObject, QP
 from PySide6.QtGui import (QAction, QColor, QImage, QIntValidator, QKeySequence, QPainter, QPen, QPixmap, QTransform, QPolygonF,
                            QPalette)
 from PySide6.QtPdf import QPdfDocument
-from PySide6.QtWidgets import (QAbstractItemView, QAbstractScrollArea, QComboBox,
+from PySide6.QtWidgets import (QAbstractItemView, QAbstractScrollArea, QComboBox, QDialog,
                                QHBoxLayout, QLabel, QLineEdit, QListView, QPushButton,
                                QStyledItemDelegate, QStyle, QVBoxLayout, QWidget, QApplication, QMenu,
                                QTabWidget)
@@ -20,7 +20,8 @@ from .search import DocumentSearch
 from .find_bar import FindBar
 from .outline import OutlineDestination, OutlinePanel
 from .links import PdfLinks
-from .annotations import Annotations
+from .annotations import Annotations, NOTE_MARKER_SIZE
+from .note_editor import NoteEditor
 
 
 class Document(QObject):
@@ -176,10 +177,11 @@ class ContinuousPageView(QAbstractScrollArea):
         self._link_press_position = None
         self._annotation_press = None
         self._ink_mode = False
+        self._note_mode = False
         self._ink_page = None
         self._ink_generation = None
         self._ink_points: list[tuple[float, float]] = []
-        self._ink_escape = False
+        self._escape_latch = False
         self._drag_timer = QTimer(self, singleShot=True)
         self._drag_timer.setInterval(16)
         self._drag_timer.timeout.connect(self._update_drag)
@@ -208,7 +210,8 @@ class ContinuousPageView(QAbstractScrollArea):
         self._clear_link_interaction()
         self._annotation_press = None
         self.set_ink_mode(False)
-        self._ink_escape = False
+        self.set_note_mode(False)
+        self._escape_latch = False
         self._drag_timer.stop()
         self._drag_page = self._drag_start = self._drag_end = None
         self.current_timer.stop()
@@ -380,7 +383,7 @@ class ContinuousPageView(QAbstractScrollArea):
         self._rest_cursor()
 
     def _set_hover_cursor(self, position):
-        if self._ink_mode:
+        if self._ink_mode or self._note_mode:
             self.viewport().setCursor(Qt.CursorShape.CrossCursor)
             return
         hit = self.viewport_to_pdf(position)
@@ -390,7 +393,7 @@ class ContinuousPageView(QAbstractScrollArea):
                                   self.reader.selection.text_hit(*hit) else Qt.CursorShape.ArrowCursor)
 
     def _rest_cursor(self) -> None:
-        self.viewport().setCursor(Qt.CursorShape.CrossCursor if self._ink_mode
+        self.viewport().setCursor(Qt.CursorShape.CrossCursor if self._ink_mode or self._note_mode
                                   else Qt.CursorShape.ArrowCursor)
 
     @property
@@ -398,15 +401,34 @@ class ContinuousPageView(QAbstractScrollArea):
         return self._ink_mode
 
     @property
+    def note_mode(self) -> bool:
+        return self._note_mode
+
+    @property
     def ink_drawing(self) -> bool:
         return self._ink_page is not None
 
+    def _note_radius(self) -> float:
+        """Half-edge of the fixed-size note marker converted into PDF-page units."""
+        return NOTE_MARKER_SIZE / 2 / max(0.001, self.zoom_scale)
+
     def set_ink_mode(self, enabled: bool) -> None:
         enabled = bool(enabled)
+        if enabled and self._note_mode:
+            self.set_note_mode(False)
         self._ink_mode = enabled
         if not enabled:
             self.cancel_ink_stroke()
         self.reader.ink_action.setChecked(enabled)
+        self._rest_cursor()
+
+    def set_note_mode(self, enabled: bool) -> None:
+        """Enter or leave Note placement mode, keeping the QAction and mode in step."""
+        enabled = bool(enabled)
+        if enabled and self._ink_mode:
+            self.set_ink_mode(False)
+        self._note_mode = enabled
+        self.reader.note_action.setChecked(enabled)
         self._rest_cursor()
 
     def _begin_ink_stroke(self, position) -> None:
@@ -442,6 +464,17 @@ class ContinuousPageView(QAbstractScrollArea):
             self.reader.annotations.add_ink(self._ink_page, self._ink_points)
         self.cancel_ink_stroke()
 
+    def _place_note(self, position) -> None:
+        """Convert the placement click to PDF coordinates immediately, then edit."""
+        self._link_press = self._link_press_position = None
+        self._annotation_press = None
+        self._drag_timer.stop()
+        self._drag_page = self._drag_start = self._drag_end = None
+        hit = self.viewport_to_pdf(position)
+        if not hit:
+            return
+        self.reader.place_note(hit[0], (hit[1].x(), hit[1].y()), self.reader.document.generation)
+
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self.setFocus(Qt.FocusReason.MouseFocusReason)
@@ -449,11 +482,15 @@ class ContinuousPageView(QAbstractScrollArea):
                 self._begin_ink_stroke(event.position())
                 event.accept()
                 return
+            if self._note_mode:
+                self._place_note(event.position())
+                event.accept()
+                return
             hit = self.viewport_to_pdf(event.position())
             self._link_press = (self._link_at(event.position()) if
                                 event.modifiers() == Qt.KeyboardModifier.NoModifier else None)
             self._link_press_position = event.position() if self._link_press else None
-            annotation = (self.reader.annotations.at(*hit)
+            annotation = (self.reader.annotations.at(*hit, note_radius=self._note_radius())
                           if hit and not self._link_press and event.modifiers() in
                           (Qt.KeyboardModifier.NoModifier, Qt.KeyboardModifier.AltModifier) else None)
             self._annotation_press = ((annotation.id, annotation.generation, event.position())
@@ -524,7 +561,8 @@ class ContinuousPageView(QAbstractScrollArea):
                 event.accept()
                 return
             hit = self.viewport_to_pdf(event.position())
-            annotation = self.reader.annotations.at(*hit) if hit else None
+            annotation = (self.reader.annotations.at(*hit, note_radius=self._note_radius())
+                          if hit else None)
             if (annotation_press and annotation and annotation.id == annotation_press[0]
                     and (event.position() - annotation_press[2]).manhattanLength()
                     < QApplication.startDragDistance()):
@@ -563,17 +601,22 @@ class ContinuousPageView(QAbstractScrollArea):
             return
         if (event.key() == Qt.Key.Key_Escape
                 and event.modifiers() == Qt.KeyboardModifier.NoModifier):
-            if self._ink_escape or event.isAutoRepeat():
+            if self._escape_latch or event.isAutoRepeat():
                 event.accept()
                 return
             if self._ink_page is not None:
-                self._ink_escape = True
+                self._escape_latch = True
                 self.cancel_ink_stroke()
                 event.accept()
                 return
             if self._ink_mode:
-                self._ink_escape = True
+                self._escape_latch = True
                 self.set_ink_mode(False)
+                event.accept()
+                return
+            if self._note_mode:
+                self._escape_latch = True
+                self.set_note_mode(False)
                 event.accept()
                 return
         if event.modifiers() == Qt.KeyboardModifier.NoModifier and self.reader.annotations.selected_id:
@@ -593,11 +636,11 @@ class ContinuousPageView(QAbstractScrollArea):
 
     def keyReleaseEvent(self, event):
         if event.key() == Qt.Key.Key_Escape and not event.isAutoRepeat():
-            self._ink_escape = False
+            self._escape_latch = False
         super().keyReleaseEvent(event)
 
     def focusOutEvent(self, event):
-        self._ink_escape = False
+        self._escape_latch = False
         super().focusOutEvent(event)
 
     def selection_at(self, position):
@@ -615,6 +658,15 @@ class ContinuousPageView(QAbstractScrollArea):
         if self.selection_at(event.pos()):
             menu = QMenu(self)
             menu.addAction(self.reader.copy_action)
+            menu.exec(event.globalPos())
+            return
+        hit = self.viewport_to_pdf(event.pos())
+        note = (self.reader.annotations.at(*hit, note_radius=self._note_radius())
+                if hit else None)
+        if note is not None and note.kind == "note":
+            self.reader.annotations.select(note.id, self.reader.document.generation)
+            menu = QMenu(self)
+            menu.addAction(self.reader.edit_note_action)
             menu.exec(event.globalPos())
             return
         super().contextMenuEvent(event)
@@ -668,6 +720,25 @@ class ContinuousPageView(QAbstractScrollArea):
                             painter.setPen(selected)
                             for start, end in zip(mapped, mapped[1:]):
                                 painter.drawLine(start, end)
+                        painter.restore()
+                        continue
+                    if item.kind == "note":
+                        center = transform.map(QPointF(*item.anchor))
+                        half = NOTE_MARKER_SIZE / 2
+                        marker = QRectF(center.x() - half, center.y() - half,
+                                        NOTE_MARKER_SIZE, NOTE_MARKER_SIZE)
+                        painter.setPen(QPen(QColor(151, 121, 40), 1))
+                        painter.setBrush(QColor(255, 232, 140, 235))
+                        painter.drawRect(marker)
+                        fold = NOTE_MARKER_SIZE * 0.34
+                        painter.setBrush(QColor(223, 197, 112, 235))
+                        painter.drawPolygon(QPolygonF([QPointF(marker.right(), marker.bottom() - fold),
+                                                       QPointF(marker.right() - fold, marker.bottom()),
+                                                       QPointF(marker.right(), marker.bottom())]))
+                        if item.id == self.reader.annotations.selected_id:
+                            painter.setBrush(Qt.BrushStyle.NoBrush)
+                            painter.setPen(QPen(QColor(70, 105, 160, 220), 2, Qt.PenStyle.DashLine))
+                            painter.drawRect(marker.adjusted(-2, -2, 2, 2))
                         painter.restore()
                         continue
                     for region in item.regions:
@@ -885,6 +956,13 @@ class Reader(QWidget):
         self.ink_action = QAction("&Ink", self, checkable=True)
         self.ink_action.triggered.connect(
             lambda checked: self.page_view.set_ink_mode(checked))
+        self.note_action = QAction("&Note", self, checkable=True)
+        self.note_action.triggered.connect(
+            lambda checked: self.page_view.set_note_mode(checked))
+        self.edit_note_action = QAction("Edit &Note", self)
+        self.edit_note_action.setEnabled(False)
+        self.edit_note_action.triggered.connect(self.edit_selected_note)
+        self.annotations.changed.connect(self._sync_note_actions)
         self.undo_action = QAction("&Undo", self)
         self.undo_action.setShortcut(QKeySequence.StandardKey.Undo)
         self.undo_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
@@ -995,6 +1073,42 @@ class Reader(QWidget):
         self.undo_action.setEnabled(self.annotations.can_undo)
         self.redo_action.setEnabled(self.annotations.can_redo)
 
+    def _sync_note_actions(self) -> None:
+        selected = self.annotations.get(self.annotations.selected_id)
+        self.edit_note_action.setEnabled(selected is not None and selected.kind == "note")
+
+    def place_note(self, page, anchor, generation) -> None:
+        """Open the transient editor for a candidate note; only an accepted edit commits."""
+        if generation != self.document.generation or self.document.pdf is None:
+            return
+        editor = NoteEditor("", self)
+        accepted = editor.exec() == QDialog.DialogCode.Accepted
+        text = editor.text()
+        editor.deleteLater()
+        if not accepted or generation != self.document.generation:
+            return
+        self.annotations.add_note(page, anchor, text)
+
+    def edit_selected_note(self) -> None:
+        """Reopen the editor for the selected note, when a note is selected."""
+        item = self.annotations.get(self.annotations.selected_id)
+        if item is None or item.kind != "note":
+            return
+        self.edit_note(item)
+
+    def edit_note(self, item) -> None:
+        """Replace one Note with edited text, keeping id, page, anchor, and generation."""
+        generation = item.generation
+        if generation != self.document.generation or self.document.pdf is None:
+            return
+        editor = NoteEditor(item.text, self)
+        accepted = editor.exec() == QDialog.DialogCode.Accepted
+        text = editor.text()
+        editor.deleteLater()
+        if not accepted or generation != self.document.generation:
+            return
+        self.annotations.update_note_text(item.id, text)
+
     def copy_selection(self):
         if self.selection.valid():
             QApplication.clipboard().setText(self.selection.result.text())
@@ -1027,6 +1141,7 @@ class Reader(QWidget):
         active = self.document.pdf is not None
         self.select_all_action.setEnabled(active)
         self.ink_action.setEnabled(active)
+        self.note_action.setEnabled(active)
         if not active:
             self._reset_document_state()
         elif self._view_generation != self.document.generation:

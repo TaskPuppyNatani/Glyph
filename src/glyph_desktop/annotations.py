@@ -1,15 +1,15 @@
-"""In-memory, document-scoped annotations (text markup and freehand ink) in PDF page
-coordinates, with a bounded undo/redo history over their mutations."""
+"""In-memory, document-scoped annotations (text markup, freehand ink, and sticky notes)
+in PDF page coordinates, with a bounded undo/redo history over their mutations."""
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from uuid import uuid4
 
 from PySide6.QtCore import QObject, Signal, Qt
 from PySide6.QtGui import QPolygonF
 from PySide6.QtCore import QPointF
 
-from .history import AnnotationHistory, CREATE, DELETE
+from .history import AnnotationHistory, CREATE, DELETE, UPDATE
 
 
 @dataclass(frozen=True)
@@ -32,9 +32,21 @@ class Ink:
     width: float
 
 
+@dataclass(frozen=True)
+class Note:
+    id: str
+    kind: str
+    page: int
+    generation: int
+    anchor: tuple[float, float]
+    text: str
+
+
 INK_WIDTH = 2.5
 INK_MIN_LENGTH = 4.0
 INK_HIT_TOLERANCE = 6.0
+# Marker edge in viewport pixels: sizing only, never stored as annotation data.
+NOTE_MARKER_SIZE = 18.0
 
 
 def stroke_length(points):
@@ -92,6 +104,18 @@ class Annotations(QObject):
         self._items.insert(max(0, min(index, len(self._items))), item)
         return True
 
+    def replace(self, index, item):
+        """Swap an updated record into its original position, keeping id and generation."""
+        if not 0 <= index < len(self._items):
+            return False
+        current = self._items[index]
+        if current.id != item.id or current.generation != self.document.generation:
+            return False
+        if item.generation != self.document.generation:
+            return False
+        self._items[index] = item
+        return True
+
     def remove(self, item_id):
         """Take one current-generation record out of the store, or return None."""
         index = self._index_of(item_id)
@@ -138,12 +162,49 @@ class Annotations(QObject):
         self.changed.emit()
         return item
 
-    def at(self, page, point):
+    def add_note(self, page, anchor, text):
+        """Create one Note from plain PDF-page values; blank text creates nothing."""
+        if not 0 <= page < self.document.count:
+            return None
+        text = (text or "").strip()
+        if not text:
+            return None
+        x, y = anchor
+        item = Note(uuid4().hex, "note", page, self.document.generation,
+                    (float(x), float(y)), text)
+        self._items.append(item)
+        self.selected_id = None
+        self.history.record(CREATE, item, len(self._items) - 1)
+        self.changed.emit()
+        return item
+
+    def update_note_text(self, item_id, text):
+        """Edit one Note in place, keeping id, page, anchor, and generation."""
+        index = self._index_of(item_id)
+        if index < 0:
+            return None
+        previous = self._items[index]
+        if previous.kind != "note":
+            return None
+        text = (text or "").strip()
+        if not text or text == previous.text:
+            return None
+        item = replace(previous, text=text)
+        self._items[index] = item
+        self.history.record(UPDATE, item, index, previous)
+        self.changed.emit()
+        return item
+
+    def at(self, page, point, note_radius=NOTE_MARKER_SIZE / 2):
         for item in reversed(self._items):
             if item.generation != self.document.generation or item.page != page:
                 continue
             if item.kind == "ink":
                 if near_polyline(item.points, point, item.width + INK_HIT_TOLERANCE):
+                    return item
+            elif item.kind == "note":
+                if (abs(point.x() - item.anchor[0]) <= note_radius
+                        and abs(point.y() - item.anchor[1]) <= note_radius):
                     return item
             elif any(QPolygonF([QPointF(x, y) for x, y in region]).containsPoint(
                     point, Qt.FillRule.OddEvenFill) for region in item.regions):
