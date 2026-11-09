@@ -5,6 +5,7 @@ import unittest
 import weakref
 from pathlib import Path
 from unittest.mock import patch
+import shiboken6
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -41,7 +42,17 @@ class AnnotationTests(unittest.TestCase):
         self.reader.deleteLater()
         self.document.deleteLater()
         self.app.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         self.temp.cleanup()
+
+    def test_close_disposes_pdf_before_fixture_cleanup(self):
+        pdf = self.document.pdf
+        self.document.close()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        self.assertFalse(shiboken6.isValid(pdf))
+        renamed = self.path.with_name("links-renamed.pdf")
+        self.path.rename(renamed)
+        renamed.rename(self.path)
 
     def make(self, kind, page=0):
         self.reader.selection.select_all(page)

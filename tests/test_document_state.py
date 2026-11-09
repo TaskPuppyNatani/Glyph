@@ -4,10 +4,11 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+import shiboken6
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QMimeData, QPoint, QPointF, QSettings, Qt, QUrl
+from PySide6.QtCore import QCoreApplication, QEvent, QMimeData, QPoint, QPointF, QSettings, Qt, QUrl
 from PySide6.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent, QPainter, QPdfWriter
 from PySide6.QtWidgets import QApplication
 
@@ -58,6 +59,18 @@ class DocumentMemoryTests(unittest.TestCase):
             window.close()
             window.deleteLater()
         self.app.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+    def test_window_cleanup_releases_open_pdf(self):
+        window = self.window()
+        self.open(window, self.a)
+        pdf = window.document.pdf
+        self.close_windows()
+        self.windows.clear()
+        self.assertFalse(shiboken6.isValid(pdf))
+        renamed = self.root / "released.pdf"
+        self.a.rename(renamed)
+        renamed.rename(self.a)
 
     def open(self, window, path):
         self.assertTrue(window.open_document(path))
