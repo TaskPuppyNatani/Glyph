@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QEvent, QPoint, QPointF, QSettings, Qt, QTimer
+from PySide6.QtCore import QCoreApplication, QEvent, QPoint, QPointF, QSettings, Qt, QTimer
 from PySide6.QtGui import QFont, QMouseEvent, QPageSize, QPainter, QPdfWriter, QWheelEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMenu
@@ -47,6 +47,7 @@ class SelectionTests(unittest.TestCase):
         settings = Settings(QSettings(str(root / "settings.ini"), QSettings.Format.IniFormat))
         self.theme = ThemeManager(self.app, settings)
         self.window = MainWindow(self.theme, "0.1", DocumentState(root / "state.json"))
+        self.addCleanup(self.close_window)
         self.window.show()
         self.assertTrue(self.window.open_document(self.pdf))
         self.app.processEvents()
@@ -54,12 +55,12 @@ class SelectionTests(unittest.TestCase):
         self.view.verticalScrollBar().setValue(0)
         self.app.processEvents()
         self.selection = self.window.reader.selection
-        self.addCleanup(self.close_window)
 
     def close_window(self):
         self.window.close()
         self.window.deleteLater()
         self.app.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
     def drag(self, start, end, page=0):
         target = self.view.viewport()
@@ -71,6 +72,15 @@ class SelectionTests(unittest.TestCase):
         QApplication.sendEvent(target, move)
         QTest.mouseRelease(target, Qt.MouseButton.LeftButton, pos=last)
         self.app.processEvents()
+
+    def hover(self, position):
+        # Deliver hover to the viewport without moving the system cursor.
+        viewport = self.view.viewport()
+        event = QMouseEvent(QEvent.Type.MouseMove, QPointF(position),
+                            QPointF(viewport.mapToGlobal(position)),
+                            Qt.MouseButton.NoButton, Qt.MouseButton.NoButton,
+                            Qt.KeyboardModifier.NoModifier)
+        QApplication.sendEvent(viewport, event)
 
     def context_menu_actions(self, position, choose_copy=False):
         from PySide6.QtGui import QContextMenuEvent
@@ -92,7 +102,14 @@ class SelectionTests(unittest.TestCase):
         self.app.processEvents()
         return seen
 
-    def test_drag_multiline_copy_escape_and_empty_area(self):
+    @patch.object(QApplication, "clipboard")
+    def test_drag_multiline_copy_escape_and_empty_area(self, clipboard_factory):
+        # Keep action/shortcut coverage independent of the shared desktop clipboard.
+        clipboard = clipboard_factory.return_value
+        contents = [""]
+        clipboard.setText.side_effect = lambda text: contents.__setitem__(0, text)
+        clipboard.text.side_effect = lambda: contents[0]
+        clipboard.clear.side_effect = lambda: contents.__setitem__(0, "")
         glyphs = self.window.document.pdf.getAllText(0).bounds()
         with patch.object(self.window.reader, "schedule_render") as render:
             self.drag(glyphs[0].boundingRect().center(), glyphs[3].boundingRect().center())
@@ -110,6 +127,7 @@ class SelectionTests(unittest.TestCase):
         self.app.processEvents()
         QTest.keyClick(self.view.viewport(), Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
         self.assertEqual(self.app.clipboard().text(), selected_text)
+        clipboard.setText.assert_called_once_with(selected_text)
         self.assertTrue(self.selection.valid())
         selected_polygon = self.selection.result.bounds()[0]
         selected_point = self.view.pdf_to_viewport(
@@ -117,6 +135,8 @@ class SelectionTests(unittest.TestCase):
         seen = self.context_menu_actions(selected_point, choose_copy=True)
         self.assertIn(self.window.reader.copy_action, seen)
         self.assertEqual(self.app.clipboard().text(), selected_text)
+        self.assertEqual(clipboard.setText.call_count, 2)
+        clipboard.setText.assert_called_with(selected_text)
         self.assertTrue(self.selection.valid())
 
         outside = self.view.viewport().rect().center()
@@ -135,11 +155,15 @@ class SelectionTests(unittest.TestCase):
         self.app.clipboard().clear()
         self.window.reader.copy_action.trigger()
         self.assertEqual(self.app.clipboard().text(), selected_text)
+        self.assertEqual(clipboard.setText.call_count, 3)
+        clipboard.setText.assert_called_with(selected_text)
         self.app.clipboard().clear()
         self.view.setFocus()
         self.app.processEvents()
         QTest.keyClick(self.view.viewport(), Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
         self.assertEqual(self.app.clipboard().text(), selected_text)
+        self.assertEqual(clipboard.setText.call_count, 4)
+        clipboard.setText.assert_called_with(selected_text)
         QTest.keyClick(self.view.viewport(), Qt.Key.Key_Escape)
         self.assertFalse(self.selection.valid())
         self.assertFalse(self.window.reader.copy_action.isEnabled())
@@ -215,9 +239,9 @@ class SelectionTests(unittest.TestCase):
         self.assertIsNone(self.view.viewport_to_pdf(QPointF(0, 0)))
         glyphs = self.window.document.pdf.getAllText(0).bounds()
         start = glyphs[0].boundingRect().center()
-        QTest.mouseMove(self.view.viewport(), self.view.pdf_to_viewport(0, start).toPoint())
+        self.hover(self.view.pdf_to_viewport(0, start).toPoint())
         self.assertEqual(self.view.viewport().cursor().shape(), Qt.CursorShape.IBeamCursor)
-        QTest.mouseMove(self.view.viewport(), QPoint(0, 0))
+        self.hover(QPoint(0, 0))
         self.assertEqual(self.view.viewport().cursor().shape(), Qt.CursorShape.ArrowCursor)
         outside = QPointF(start.x(), self.window.document.page_sizes[0][1] + 100)
         self.drag(start, outside)

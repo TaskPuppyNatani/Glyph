@@ -93,8 +93,9 @@ class FoundationTests(unittest.TestCase):
         y = (packaged.height() - canonical.height()) // 2
         source_area = packaged.copy(QRect(x, y, canonical.width(), canonical.height()))
         pixel_format = QImage.Format.Format_RGBA8888
-        self.assertEqual(bytes(source_area.convertToFormat(pixel_format).constBits()),
-                         bytes(canonical.convertToFormat(pixel_format).constBits()))
+        source_pixels = source_area.convertToFormat(pixel_format)
+        canonical_pixels = canonical.convertToFormat(pixel_format)
+        self.assertEqual(bytes(source_pixels.constBits()), bytes(canonical_pixels.constBits()))
         for x, y in ((0, 0), (2047, 0), (0, 2047), (2047, 2047)):
             self.assertEqual(packaged.pixelColor(x, y).alpha(), 0)
         self.assertFalse(logo_pixmap().isNull())

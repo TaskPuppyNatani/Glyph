@@ -40,6 +40,7 @@ class InkTests(unittest.TestCase):
         self.reader.deleteLater()
         self.document.deleteLater()
         self.app.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         self.temp.cleanup()
 
     def ink(self):
