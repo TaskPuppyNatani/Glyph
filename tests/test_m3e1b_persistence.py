@@ -1,3 +1,4 @@
+import ctypes
 import hashlib
 import os
 import stat
@@ -482,6 +483,47 @@ class PersistenceFoundationTests(unittest.TestCase):
             finally:
                 document.close()
 
+    def test_windows_absolute_rename_arguments_and_unicode(self):
+        from glyph_desktop import pdf_writer
+
+        path = "C:\\Glyph\\résumé-🐾.pdf"
+        observed = {}
+
+        class Kernel:
+            def SetFileInformationByHandle(self, handle, info_class, pointer, size):
+                info = ctypes.cast(pointer, ctypes.POINTER(pdf_writer._WindowsRenameInfo)).contents
+                observed.update(handle=handle.value, info_class=info_class, size=size,
+                                root=info.RootDirectory, replace=info.ReplaceIfExists,
+                                length=info.FileNameLength,
+                                name=ctypes.string_at(pointer.value + pdf_writer._WindowsRenameInfo.FileName.offset,
+                                                      info.FileNameLength))
+                return True
+
+        with patch.object(pdf_writer, "_windows_api", return_value=Kernel()):
+            pdf_writer._windows_publish_by_handle(42, path)
+        self.assertEqual(observed["handle"], 42)
+        self.assertEqual(observed["info_class"], 3)
+        self.assertIsNone(observed["root"])
+        self.assertEqual(observed["replace"], 0)
+        self.assertEqual(observed["length"], len(path.encode("utf-16-le")))
+        self.assertEqual(observed["name"].decode("utf-16-le"), path)
+        self.assertEqual(observed["size"], max(ctypes.sizeof(pdf_writer._WindowsRenameInfo),
+                                              pdf_writer._WindowsRenameInfo.FileName.offset + observed["length"]))
+        self.assertEqual(pdf_writer._WindowsRenameInfo.RootDirectory.offset,
+                         ctypes.sizeof(ctypes.c_void_p))
+        with self.assertRaisesRegex(ValueError, "absolute"):
+            pdf_writer._windows_rename_buffer("relative.pdf")
+        with self.assertRaisesRegex(ValueError, "unsupported"):
+            pdf_writer._windows_rename_buffer("\\\\server\\share\\file.pdf")
+        class ExistingTargetKernel:
+            def SetFileInformationByHandle(self, handle, info_class, pointer, size):
+                return False
+
+        with (patch.object(pdf_writer, "_windows_api", return_value=ExistingTargetKernel()),
+              patch.object(ctypes, "get_last_error", return_value=183, create=True)):
+            with self.assertRaises(FileExistsError):
+                pdf_writer._windows_publish_by_handle(42, path)
+
     def test_same_path_and_existing_destination_are_never_overwritten(self):
         source = _core_fixture(self.root / "source.pdf")
         before = source.read_bytes()
@@ -504,9 +546,9 @@ class PersistenceFoundationTests(unittest.TestCase):
         if os.name == "nt":
             original_publish = pdf_writer._windows_publish_by_handle
 
-            def create_conflict(file_handle, directory_handle, destination_name):
+            def create_conflict(file_handle, destination_name):
                 destination.write_bytes(b"concurrent file")
-                return original_publish(file_handle, directory_handle, destination_name)
+                return original_publish(file_handle, destination_name)
 
             patcher = patch("glyph_desktop.pdf_writer._windows_publish_by_handle",
                             side_effect=create_conflict)
@@ -550,7 +592,7 @@ class PersistenceFoundationTests(unittest.TestCase):
 
         source = _core_fixture(self.root / "handle-source.pdf")
         before = source.read_bytes()
-        destination = self.root / "handle-output.pdf"
+        destination = self.root / "handle-résumé-🐾.pdf"
         original_validate = pdf_writer._validate_output
         original_qt_stream = pdf_writer._qt_stream_page_sizes
         original_qt_path = pdf_writer._qt_page_sizes
@@ -572,10 +614,11 @@ class PersistenceFoundationTests(unittest.TestCase):
         if os.name == "nt":
             original_publish = pdf_writer._windows_publish_by_handle
 
-            def publish(handle, directory, name):
+            def publish(handle, name):
                 self.assertEqual(handle, seen["handle"])
+                self.assertEqual(name, str(destination.resolve()))
                 os.fstat(seen["fd"])
-                return original_publish(handle, directory, name)
+                return original_publish(handle, name)
 
             publisher = patch.object(pdf_writer, "_windows_publish_by_handle", side_effect=publish)
         else:

@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import ctypes
 import errno
 import math
+import ntpath
 import os
 from pathlib import Path
 import secrets
@@ -225,43 +226,43 @@ def _create_windows_stage_fd(path: Path) -> int:
         raise
 
 
-def _open_windows_directory(path: Path):
-    """Open a destination directory handle for relative no-replace rename."""
-    from ctypes import wintypes
-
-    kernel = _windows_api()
-    handle = kernel.CreateFileW(str(path), 0x0002 | 0x0080,
-                               0x00000001 | 0x00000002 | 0x00000004,
-                               None, 3, 0x02000000, None)
-    if handle == wintypes.HANDLE(-1).value:
-        raise ctypes.WinError(ctypes.get_last_error())
-    return kernel, handle
+class _WindowsRenameInfo(ctypes.Structure):
+    _fields_ = [("ReplaceIfExists", ctypes.c_ubyte),
+                ("RootDirectory", ctypes.c_void_p),
+                ("FileNameLength", ctypes.c_uint32),
+                ("FileName", ctypes.c_uint16 * 1)]
 
 
-def _windows_publish_by_handle(file_handle, directory_handle, destination_name: str):
+def _windows_rename_buffer(destination_name: str):
+    drive, _ = ntpath.splitdrive(destination_name)
+    if not ntpath.isabs(destination_name) or not drive:
+        raise ValueError("Windows destination must be an absolute path")
+    if drive.startswith("\\\\") and not (drive.startswith("\\\\?\\")
+                                              and len(drive) == 6 and drive[5] == ":"):
+        raise ValueError("Windows network or device destination paths are unsupported")
+    encoded = destination_name.encode("utf-16-le")
+    buffer_size = max(ctypes.sizeof(_WindowsRenameInfo),
+                      _WindowsRenameInfo.FileName.offset + len(encoded))
+    buffer = ctypes.create_string_buffer(buffer_size)
+    info = ctypes.cast(buffer, ctypes.POINTER(_WindowsRenameInfo)).contents
+    info.ReplaceIfExists = 0
+    info.RootDirectory = None
+    info.FileNameLength = len(encoded)
+    ctypes.memmove(ctypes.addressof(buffer) + _WindowsRenameInfo.FileName.offset,
+                   encoded, len(encoded))
+    return buffer
+
+
+def _windows_publish_by_handle(file_handle, destination_name: str):
     """Atomically rename the validated handle without replacing a target."""
     from ctypes import wintypes
 
     kernel = _windows_api()
 
-    class RenameInfo(ctypes.Structure):
-        _fields_ = [("ReplaceIfExists", ctypes.c_ubyte),
-                    ("RootDirectory", wintypes.HANDLE),
-                    ("FileNameLength", wintypes.DWORD),
-                    ("FileName", wintypes.WCHAR * 1)]
-
-    encoded = destination_name.encode("utf-16-le")
-    buffer_size = RenameInfo.FileName.offset + len(encoded)
-    buffer = ctypes.create_string_buffer(buffer_size)
-    info = ctypes.cast(buffer, ctypes.POINTER(RenameInfo)).contents
-    info.ReplaceIfExists = 0
-    info.RootDirectory = wintypes.HANDLE(directory_handle)
-    info.FileNameLength = len(encoded)
-    ctypes.memmove(ctypes.addressof(buffer) + RenameInfo.FileName.offset,
-                   encoded, len(encoded))
+    buffer = _windows_rename_buffer(destination_name)
     if not kernel.SetFileInformationByHandle(
             wintypes.HANDLE(file_handle), 3, ctypes.cast(buffer, ctypes.c_void_p),
-            buffer_size):
+            ctypes.sizeof(buffer)):
         code = ctypes.get_last_error()
         if code in (80, 183):  # ERROR_FILE_EXISTS / ERROR_ALREADY_EXISTS
             raise FileExistsError("Destination already exists; it was not overwritten")
@@ -415,7 +416,6 @@ def write_annotated_pdf(source_path, destination_path,
     stream = None
     unowned_descriptor = None
     stage_fd = destination_fd = None
-    destination_handle = destination_kernel = None
     error_text = None
     cleanup_errors = []
     published = crash_durable = False
@@ -477,7 +477,6 @@ def write_annotated_pdf(source_path, destination_path,
         temporary = stage_directory / "validated-output.tmp"
         if os.name == "nt":
             unowned_descriptor = _create_windows_stage_fd(temporary)
-            destination_kernel, destination_handle = _open_windows_directory(destination_parent)
         else:
             unowned_descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_RDWR
                                          | getattr(os, "O_CLOEXEC", 0), 0o600)
@@ -495,8 +494,7 @@ def write_annotated_pdf(source_path, destination_path,
 
         if os.name == "nt":
             import msvcrt
-            _windows_publish_by_handle(msvcrt.get_osfhandle(stream.fileno()),
-                                       destination_handle, destination.name)
+            _windows_publish_by_handle(msvcrt.get_osfhandle(stream.fileno()), str(destination))
             published = True
             warning = WINDOWS_DURABILITY_WARNING
         else:
@@ -525,12 +523,6 @@ def write_annotated_pdf(source_path, destination_path,
                 os.close(descriptor)
             except Exception as error:
                 cleanup_errors.append(f"close {label}: {type(error).__name__}: {error}")
-    if destination_handle is not None:
-        try:
-            if not destination_kernel.CloseHandle(destination_handle):
-                raise ctypes.WinError(ctypes.get_last_error())
-        except Exception as error:
-            cleanup_errors.append(f"close destination directory: {type(error).__name__}: {error}")
     try:
         _cleanup_staged_file(temporary)
     except Exception as error:

@@ -46,8 +46,8 @@ access to the current user, SYSTEM, and Builtin Administrators. Staging uses a
 retained open file descriptor/handle through validation and publication. Linux
 publishes by linking that descriptor into a pinned destination directory with
 no-replace semantics. Windows opens the staging file without delete sharing
-and renames that same handle relative to an opened destination directory with
-replacement disabled. The published file keeps the staging file's restrictive
+and renames that same handle to an absolute destination path with replacement
+disabled. The published file keeps the staging file's restrictive
 permissions (mode `0600` on Linux and the staging DACL on Windows). Unsupported
 platforms fail closed.
 
@@ -65,9 +65,16 @@ while the handle is open. A process running as the same user is outside the
 isolation boundary: it can inspect or interfere with that user's files and
 process. The writer also cannot stop a process with write/rename permission on
 the destination directory from changing or removing the published file after
-the call returns. The directory is pinned during publication and the final
-entry is created without replacement, but callers should use a destination
-directory they trust and should not treat the file as immutable afterward.
+the call returns. Linux pins the destination directory during publication.
+Windows resolves the absolute destination path again at rename: a process
+able to replace a destination directory or ancestor, including through a
+junction or symlink, can redirect publication between checks and rename.
+Windows callers must use a trusted local destination and its trusted ancestors;
+UNC network and device namespace destinations are rejected; mapped drives and
+filesystem properties are not independently verified. This API does not
+provide adversarial shared-directory safety. Path checks do
+not eliminate that race. On both platforms the final entry is created without
+replacement; callers should not treat the file as immutable afterward.
 
 On Linux, output bytes are flushed and `fsync`ed before validation/publication;
 after the no-replace link, the destination directory is `fsync`ed before the
