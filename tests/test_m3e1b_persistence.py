@@ -836,7 +836,9 @@ class PersistenceFoundationTests(unittest.TestCase):
     def test_cleanup_failure_does_not_escape_result_or_claim_success(self):
         source = _core_fixture(self.root / "source.pdf")
         destination = self.root / "cleanup-failed.pdf"
-        with patch("glyph_desktop.pdf_writer._cleanup_staged_file",
+        cleanup_target = ("_cleanup_stage_directory" if os.name == "nt"
+                          else "_cleanup_staged_file")
+        with patch(f"glyph_desktop.pdf_writer.{cleanup_target}",
                    side_effect=OSError("injected cleanup failure")):
             result = write_annotated_pdf(source, destination, ())
         self.assertFalse(result.success)
@@ -846,6 +848,11 @@ class PersistenceFoundationTests(unittest.TestCase):
         self.assertIn("Cleanup failed", result.error)
         self.assertIn("injected cleanup failure", result.error)
         self.assertTrue(destination.is_file())
+        saved = PdfReader(destination, strict=True)
+        original = PdfReader(source, strict=True)
+        self.assertEqual(len(saved.pages), len(original.pages))
+        self.assertEqual([page.extract_text() for page in saved.pages],
+                         [page.extract_text() for page in original.pages])
 
         failed_destination = self.root / "validation-and-cleanup-failed.pdf"
         with (patch("glyph_desktop.pdf_writer._validate_output",
