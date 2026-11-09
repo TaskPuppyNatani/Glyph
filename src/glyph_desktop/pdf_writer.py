@@ -132,6 +132,11 @@ def _windows_api():
     kernel.SetFileInformationByHandle.argtypes = [wintypes.HANDLE, wintypes.DWORD,
                                                    ctypes.c_void_p, wintypes.DWORD]
     kernel.SetFileInformationByHandle.restype = wintypes.BOOL
+    kernel.GetFileInformationByHandle.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+    kernel.GetFileInformationByHandle.restype = wintypes.BOOL
+    kernel.GetFileInformationByHandleEx.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                                    ctypes.c_void_p, wintypes.DWORD]
+    kernel.GetFileInformationByHandleEx.restype = wintypes.BOOL
     return kernel
 
 
@@ -242,7 +247,7 @@ def _windows_rename_buffer(destination_name: str):
         raise ValueError("Windows network or device destination paths are unsupported")
     encoded = destination_name.encode("utf-16-le")
     buffer_size = max(ctypes.sizeof(_WindowsRenameInfo),
-                      _WindowsRenameInfo.FileName.offset + len(encoded))
+                      _WindowsRenameInfo.FileName.offset + len(encoded) + 2)
     buffer = ctypes.create_string_buffer(buffer_size)
     info = ctypes.cast(buffer, ctypes.POINTER(_WindowsRenameInfo)).contents
     info.ReplaceIfExists = 0
@@ -267,6 +272,42 @@ def _windows_publish_by_handle(file_handle, destination_name: str):
         if code in (80, 183):  # ERROR_FILE_EXISTS / ERROR_ALREADY_EXISTS
             raise FileExistsError("Destination already exists; it was not overwritten")
         raise ctypes.WinError(code)
+
+
+class _WindowsFileInformation(ctypes.Structure):
+    _fields_ = [(name, ctypes.c_uint32) for name in (
+        "attributes", "creation_low", "creation_high", "access_low", "access_high",
+        "write_low", "write_high", "volume_serial", "size_high", "size_low",
+        "links", "index_high", "index_low")]
+
+
+class _WindowsFileId(ctypes.Structure):
+    _fields_ = [("volume_serial", ctypes.c_uint64), ("file_id", ctypes.c_ubyte * 16)]
+
+
+def _windows_verify_published_file(file_handle, destination_name: str):
+    """Compare the named entry with the still-open validated file handle."""
+    from ctypes import wintypes
+
+    kernel = _windows_api()
+    target = kernel.CreateFileW(destination_name, 0x80, 0x7, None, 3, 0x00200000, None)
+    if target == wintypes.HANDLE(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        expected, actual = _WindowsFileId(), _WindowsFileId()
+        attrs = _WindowsFileInformation()
+        if not kernel.GetFileInformationByHandle(wintypes.HANDLE(target), ctypes.byref(attrs)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        for handle, info in ((file_handle, expected), (target, actual)):
+            if not kernel.GetFileInformationByHandleEx(wintypes.HANDLE(handle), 18,
+                                                       ctypes.byref(info), ctypes.sizeof(info)):
+                raise ctypes.WinError(ctypes.get_last_error())
+        if (attrs.attributes & 0x400 or not any(expected.file_id) or
+                (actual.volume_serial, bytes(actual.file_id)) !=
+                (expected.volume_serial, bytes(expected.file_id))):
+            raise ValueError("Intended destination does not identify the validated file")
+    finally:
+        kernel.CloseHandle(target)
 
 
 def _open_posix_directory(path: Path) -> int:
@@ -418,7 +459,7 @@ def write_annotated_pdf(source_path, destination_path,
     stage_fd = destination_fd = None
     error_text = None
     cleanup_errors = []
-    published = crash_durable = False
+    published = crash_durable = destination_verified = False
     warning = None
 
     try:
@@ -497,10 +538,17 @@ def write_annotated_pdf(source_path, destination_path,
             _windows_publish_by_handle(msvcrt.get_osfhandle(stream.fileno()), str(destination))
             published = True
             warning = WINDOWS_DURABILITY_WARNING
+            try:
+                _windows_verify_published_file(msvcrt.get_osfhandle(stream.fileno()), str(destination))
+            except Exception as error:
+                raise RuntimeError(f"PDF was published, but its destination could not be verified; "
+                                   f"actual location is unknown: {error}") from error
+            destination_verified = True
         else:
             _link_fd_noclobber(stream.fileno(), temporary.name, stage_fd,
                                destination.name, destination_fd)
             published = True
+            destination_verified = True
             os.fsync(destination_fd)
             crash_durable = True
     except Exception as error:
@@ -523,10 +571,11 @@ def write_annotated_pdf(source_path, destination_path,
                 os.close(descriptor)
             except Exception as error:
                 cleanup_errors.append(f"close {label}: {type(error).__name__}: {error}")
-    try:
-        _cleanup_staged_file(temporary)
-    except Exception as error:
-        cleanup_errors.append(f"remove staged output: {type(error).__name__}: {error}")
+    if not (os.name == "nt" and published):
+        try:
+            _cleanup_staged_file(temporary)
+        except Exception as error:
+            cleanup_errors.append(f"remove staged output: {type(error).__name__}: {error}")
     try:
         _cleanup_stage_directory(stage_directory)
     except Exception as error:
@@ -536,5 +585,5 @@ def write_annotated_pdf(source_path, destination_path,
         cleanup_text = "Cleanup failed: " + "; ".join(cleanup_errors)
         error_text = f"{error_text}; {cleanup_text}" if error_text else cleanup_text
     success = error_text is None
-    return WriteResult(success, destination if published else None, error_text,
+    return WriteResult(success, destination if published and destination_verified else None, error_text,
                        published, crash_durable, warning)

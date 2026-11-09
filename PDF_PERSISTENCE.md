@@ -98,6 +98,12 @@ they do not erase an earlier error or turn a failed save into a reported
 success. If cleanup fails after publication, `published` and `output_path`
 remain set so callers can distinguish that state.
 
+After a Windows rename succeeds, the writer opens the intended destination for
+attributes and compares its volume and 128-bit file ID to the retained validated
+handle. If that check fails, it reports `success=False`, `published=True`,
+`output_path=None`, and an unknown actual location; it does not delete the
+published file. This check does not eliminate the directory-redirection race.
+
 ## Rendering and preservation limits
 
 QtPdf's base-page rendering keeps native annotation rendering disabled. While a

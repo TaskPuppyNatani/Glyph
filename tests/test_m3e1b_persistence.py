@@ -508,7 +508,7 @@ class PersistenceFoundationTests(unittest.TestCase):
         self.assertEqual(observed["length"], len(path.encode("utf-16-le")))
         self.assertEqual(observed["name"].decode("utf-16-le"), path)
         self.assertEqual(observed["size"], max(ctypes.sizeof(pdf_writer._WindowsRenameInfo),
-                                              pdf_writer._WindowsRenameInfo.FileName.offset + observed["length"]))
+                                              pdf_writer._WindowsRenameInfo.FileName.offset + observed["length"] + 2))
         self.assertEqual(pdf_writer._WindowsRenameInfo.RootDirectory.offset,
                          ctypes.sizeof(ctypes.c_void_p))
         with self.assertRaisesRegex(ValueError, "absolute"):
@@ -523,6 +523,78 @@ class PersistenceFoundationTests(unittest.TestCase):
               patch.object(ctypes, "get_last_error", return_value=183, create=True)):
             with self.assertRaises(FileExistsError):
                 pdf_writer._windows_publish_by_handle(42, path)
+
+    def test_windows_rename_buffer_has_utf16_terminator(self):
+        from glyph_desktop import pdf_writer
+
+        for path in ("C:\\a", "C:\\ab", "C:\\abc", "C:\\" + "x" * 200 + ".pdf",
+                     "C:\\résumé-🐾.pdf"):
+            with self.subTest(path=path):
+                buffer = pdf_writer._windows_rename_buffer(path)
+                info = ctypes.cast(buffer, ctypes.POINTER(pdf_writer._WindowsRenameInfo)).contents
+                encoded = path.encode("utf-16-le")
+                offset = pdf_writer._WindowsRenameInfo.FileName.offset
+                self.assertEqual(info.FileNameLength, len(encoded))
+                self.assertEqual(buffer.raw[offset:offset + len(encoded)], encoded)
+                self.assertEqual(buffer.raw[offset + len(encoded):offset + len(encoded) + 2], b"\0\0")
+                self.assertGreaterEqual(ctypes.sizeof(buffer), ctypes.sizeof(pdf_writer._WindowsRenameInfo))
+
+    def test_windows_destination_identity_check_closes_handle(self):
+        from glyph_desktop import pdf_writer
+
+        class Kernel:
+            def __init__(self, mismatch=False):
+                self.mismatch = mismatch
+                self.closed = []
+
+            def CreateFileW(self, *args):
+                return 23
+
+            def GetFileInformationByHandle(self, handle, pointer):
+                info = ctypes.cast(pointer, ctypes.POINTER(pdf_writer._WindowsFileInformation)).contents
+                info.attributes = 0
+                return True
+
+            def GetFileInformationByHandleEx(self, handle, info_class, pointer, size):
+                info = ctypes.cast(pointer, ctypes.POINTER(pdf_writer._WindowsFileId)).contents
+                info.volume_serial = 5
+                info.file_id[0] = 8 if self.mismatch and handle.value == 23 else 7
+                return True
+
+            def CloseHandle(self, handle):
+                self.closed.append(handle)
+                return True
+
+        for mismatch in (False, True):
+            kernel = Kernel(mismatch)
+            with patch.object(pdf_writer, "_windows_api", return_value=kernel):
+                if mismatch:
+                    with self.assertRaisesRegex(ValueError, "does not identify"):
+                        pdf_writer._windows_verify_published_file(42, "C:\\a.pdf")
+                else:
+                    pdf_writer._windows_verify_published_file(42, "C:\\a.pdf")
+            self.assertEqual(kernel.closed, [23])
+
+    @unittest.skipUnless(os.name == "nt", "requires native Windows rename")
+    def test_windows_unexpected_publication_name_reports_unknown_location(self):
+        from glyph_desktop import pdf_writer
+
+        source = _core_fixture(self.root / "source-unexpected.pdf")
+        before = source.read_bytes()
+        destination = self.root / "requested.pdf"
+        unexpected = self.root / "unexpected.pdf"
+        publish = pdf_writer._windows_publish_by_handle
+        with patch.object(pdf_writer, "_windows_publish_by_handle",
+                          side_effect=lambda handle, name: publish(handle, str(unexpected))):
+            result = write_annotated_pdf(source, destination, ())
+        self.assertFalse(result.success)
+        self.assertTrue(result.published)
+        self.assertFalse(result.crash_durable)
+        self.assertIsNone(result.output_path)
+        self.assertIn("actual location is unknown", result.error)
+        self.assertFalse(destination.exists())
+        self.assertTrue(unexpected.exists())
+        self.assertEqual(source.read_bytes(), before)
 
     def test_same_path_and_existing_destination_are_never_overwritten(self):
         source = _core_fixture(self.root / "source.pdf")
