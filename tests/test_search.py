@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QEventLoop, QSettings, Qt, QTimer
+from PySide6.QtCore import QCoreApplication, QEvent, QEventLoop, QSettings, Qt, QTimer
 from PySide6.QtGui import QFont, QPageSize, QPainter, QPdfWriter
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
@@ -60,18 +60,19 @@ class SearchTests(unittest.TestCase):
         settings = Settings(QSettings(str(root / "settings.ini"), QSettings.Format.IniFormat))
         self.theme = ThemeManager(self.app, settings)
         self.window = MainWindow(self.theme, "0.1", DocumentState(root / "state.json"))
+        self.addCleanup(self.close_window)
         self.window.show()
         self.assertTrue(self.window.open_document(self.pdf))
         self.app.processEvents()
         self.reader = self.window.reader
         self.search = self.reader.search
         self.view = self.reader.page_view
-        self.addCleanup(self.close_window)
 
     def close_window(self):
         self.window.close()
         self.window.deleteLater()
         self.app.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
     def wait_for_search(self, timeout_ms=8000):
         if not self.search.searching:

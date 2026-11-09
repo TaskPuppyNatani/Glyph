@@ -74,10 +74,20 @@ class LinkTests(unittest.TestCase):
         self.reader.deleteLater()
         self.document.deleteLater()
         self.app.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         self.temp.cleanup()
 
     def hit(self, x, y, page=0):
         return self.reader.links.hit(page, QPointF(x, y))
+
+    def hover(self, position):
+        # Deliver hover to the viewport without moving the system cursor.
+        viewport = self.reader.page_view.viewport()
+        event = QMouseEvent(QEvent.Type.MouseMove, QPointF(position),
+                            QPointF(viewport.mapToGlobal(position)),
+                            Qt.MouseButton.NoButton, Qt.MouseButton.NoButton,
+                            Qt.KeyboardModifier.NoModifier)
+        QApplication.sendEvent(viewport, event)
 
     def test_internal_and_external_targets(self):
         first = self.hit(100, 100)
@@ -120,7 +130,7 @@ class LinkTests(unittest.TestCase):
     def test_click_drag_cursor_and_stale_target(self):
         view = self.reader.page_view
         point = view.pdf_to_viewport(0, QPointF(100, 100)).toPoint()
-        QTest.mouseMove(view.viewport(), point)
+        self.hover(point)
         self.assertEqual(view.viewport().cursor().shape(), Qt.CursorShape.PointingHandCursor)
         target = self.hit(100, 100)
         with patch.object(self.reader.links, "activate", wraps=self.reader.links.activate) as activate:
@@ -199,7 +209,7 @@ class LinkTests(unittest.TestCase):
         self.assertEqual(self.reader.search.results, results)
         self.reader.navigate_to_page(0)
         point = view.pdf_to_viewport(0, QPointF(100, 200)).toPoint()
-        QTest.mouseMove(view.viewport(), point)
+        self.hover(point)
         self.assertEqual(view.viewport().cursor().shape(), Qt.CursorShape.PointingHandCursor)
         QTest.mousePress(view.viewport(), Qt.MouseButton.LeftButton, pos=point)
         active_model = self.reader.links.model

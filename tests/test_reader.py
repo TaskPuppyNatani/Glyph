@@ -79,7 +79,13 @@ class ReaderTests(unittest.TestCase):
         self.assertEqual(len(view.page_rects), 4)
         for index, rect in enumerate(view.page_rects):
             source_width, source_height = self.doc.page_sizes[index]
-            self.assertAlmostEqual(rect.width() / rect.height(), source_width / source_height, places=3)
+            ratio = source_width / source_height
+            # Width and height are each rounded to the nearest pixel. Their
+            # maximum combined contribution to the ratio is (0.5 + 0.5*r)/h.
+            self.assertGreaterEqual(source_width * view.zoom_scale, 0.5)
+            self.assertGreaterEqual(source_height * view.zoom_scale, 0.5)
+            tolerance = (0.5 + 0.5 * ratio) / rect.height()
+            self.assertAlmostEqual(rect.width() / rect.height(), ratio, delta=tolerance + 1e-12)
             self.assertAlmostEqual(rect.center().x(), view.virtual_width / 2, places=2)
             if index:
                 self.assertAlmostEqual(rect.top() - view.page_rects[index - 1].bottom(),

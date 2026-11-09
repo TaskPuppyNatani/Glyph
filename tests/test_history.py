@@ -5,7 +5,7 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QEvent, QSettings, QPointF, Qt
+from PySide6.QtCore import QCoreApplication, QEvent, QSettings, QPointF, Qt
 from PySide6.QtGui import QKeySequence, QMouseEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMenu
@@ -43,6 +43,7 @@ class HistoryTests(unittest.TestCase):
         self.reader.deleteLater()
         self.document.deleteLater()
         self.app.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         self.temp.cleanup()
 
     def make(self, kind, page=0):
@@ -455,6 +456,7 @@ class HistoryMenuTests(unittest.TestCase):
         self.window.close()
         self.window.deleteLater()
         self.app.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         self.temp.cleanup()
 
     def make(self, kind, page=0):
