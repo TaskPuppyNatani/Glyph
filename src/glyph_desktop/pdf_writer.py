@@ -10,7 +10,6 @@ rendering and suppress matching overlays; enabling both would draw twice.
 from dataclasses import dataclass
 import ctypes
 import errno
-import math
 import ntpath
 import os
 from pathlib import Path
@@ -20,7 +19,7 @@ import tempfile
 from typing import Iterable
 
 from pypdf import PdfReader, PdfWriter
-from pypdf.generic import ArrayObject, DictionaryObject, IndirectObject, NameObject
+from pypdf.generic import ArrayObject, DictionaryObject, FloatObject, IndirectObject, NameObject
 from PySide6.QtCore import QFile, QFileDevice, QIODevice
 from PySide6.QtPdf import QPdfDocument
 
@@ -376,10 +375,20 @@ def _annotation_record(page_number, annotation):
     return record
 
 
+def _same_number(actual, expected):
+    try:
+        # Match the number pypdf itself writes. FloatObject deliberately limits
+        # decimal precision, so comparing the reopened value to the original
+        # binary float can reject valid annotation geometry.
+        serialized_expected = float(FloatObject(expected).myrepr())
+        return float(actual) == serialized_expected
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 def _same_numbers(actual, expected):
     return (len(actual) == len(expected)
-            and all(math.isclose(float(left), float(right), rel_tol=1e-9, abs_tol=1e-7)
-                    for left, right in zip(actual, expected)))
+            and all(_same_number(left, right) for left, right in zip(actual, expected)))
 
 
 def _matches_annotation(actual, expected):
@@ -395,8 +404,8 @@ def _matches_annotation(actual, expected):
             return False
     if "contents" in expected and actual.get("contents") != expected["contents"]:
         return False
-    if "border_width" in expected and not math.isclose(
-            actual.get("border_width", -1), expected["border_width"], rel_tol=1e-9, abs_tol=1e-7):
+    if "border_width" in expected and not _same_number(
+            actual.get("border_width", -1), expected["border_width"]):
         return False
     return True
 

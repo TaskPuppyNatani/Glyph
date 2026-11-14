@@ -1,5 +1,6 @@
 import ctypes
 import hashlib
+import math
 import os
 import stat
 import tempfile
@@ -20,7 +21,8 @@ from pypdf.generic import (ArrayObject, DictionaryObject, FloatObject, NameObjec
 from glyph_desktop.annotations import Ink, Markup, Note
 from glyph_desktop.pdf_annotations import convert_annotation
 from glyph_desktop.pdf_geometry import GeometryError, PageGeometry
-from glyph_desktop.pdf_writer import (_create_private_stage, write_annotated_pdf)
+from glyph_desktop.pdf_writer import (_annotation_record, _create_private_stage,
+                                     _matches_annotation, write_annotated_pdf)
 from test_links import write_link_pdf
 
 
@@ -482,6 +484,60 @@ class PersistenceFoundationTests(unittest.TestCase):
                 self.assertEqual(document.status(), QPdfDocument.Status.Ready)
             finally:
                 document.close()
+
+    def test_writer_roundtrips_long_fractional_ink_at_pdf_number_precision(self):
+        source = _geometry_pdf(self.root / "fractional-ink-source.pdf")
+        source_bytes = source.read_bytes()
+        source_reader = PdfReader(source, strict=True)
+        geometry = PageGeometry.from_page(source_reader.pages[0], _qt_page_sizes(source)[0])
+        inks = tuple(
+            Ink(f"fractional-ink-{stroke}", "ink", 0, 1,
+                tuple((31.123456789 + stroke * 14.234567891 + index * 0.717391304
+                       + 1.7 * math.sin(index * 0.061 + stroke),
+                       105.987654321 + stroke * 25.345678912 + index * 0.091234567
+                       + 7.65 * math.sin(index * 0.083 + stroke))
+                      for index in range(301)),
+                2.5)
+            for stroke in range(3))
+        destination = self.root / "fractional-ink-output.pdf"
+
+        result = write_annotated_pdf(source, destination, inks)
+
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(result.output_path, destination)
+        self.assertTrue(result.published)
+        self.assertEqual(source.read_bytes(), source_bytes)
+        output = PdfReader(destination, strict=True)
+        saved = {str(reference.get_object().get("/NM")): reference.get_object()
+                 for reference in output.pages[0].get("/Annots", [])
+                 if reference.get_object().get("/NM")}
+        self.assertEqual(set(saved), {item.id for item in inks})
+
+        for item in inks:
+            with self.subTest(annotation=item.id):
+                expected = _annotation_record(0, convert_annotation(item, geometry))
+                actual = _annotation_record(0, saved[item.id])
+                self.assertTrue(_matches_annotation(actual, expected))
+                self.assertEqual(actual["rect"], tuple(
+                    float(FloatObject(value).myrepr()) for value in expected["rect"]))
+                self.assertEqual(actual["ink_list"][0], tuple(
+                    float(FloatObject(value).myrepr()) for value in expected["ink_list"][0]))
+
+                altered = dict(actual)
+                changed_stroke = list(actual["ink_list"][0])
+                changed_stroke[0] += 0.001
+                altered["ink_list"] = (tuple(changed_stroke), *actual["ink_list"][1:])
+                self.assertFalse(_matches_annotation(altered, expected))
+
+                missing = dict(actual)
+                del missing["ink_list"]
+                self.assertFalse(_matches_annotation(missing, expected))
+
+                malformed = dict(actual)
+                malformed["ink_list"] = (actual["ink_list"][0][:-1],)
+                self.assertFalse(_matches_annotation(malformed, expected))
+
+        self.assertEqual(list(self.root.glob(f".{destination.name}.glyph-stage-*")), [])
 
     def test_windows_absolute_rename_arguments_and_unicode(self):
         from glyph_desktop import pdf_writer
