@@ -1,3 +1,4 @@
+import hashlib
 import os
 import tempfile
 import unittest
@@ -10,7 +11,11 @@ from PySide6.QtCore import (QCoreApplication, QEvent, QEventLoop, QPoint, QPoint
                             QSettings, QSize, QTimer, Qt)
 from PySide6.QtGui import QImage, QKeyEvent, QPainter, QPdfWriter, QWheelEvent
 from PySide6.QtWidgets import QApplication
+from pypdf import PdfReader
 
+from glyph_desktop.annotations import Ink, Markup, Note
+from glyph_desktop.pdf_geometry import PageGeometry
+from glyph_desktop.pdf_writer import write_annotated_pdf
 from glyph_desktop.reader import (Document, PageCanvas, Reader,
                                   current_page_for_viewport)
 from glyph_desktop.rendering import BoundedImageCache, make_render_job
@@ -440,6 +445,66 @@ class ReaderTests(unittest.TestCase):
         self.assertFalse(results[0][1].isNull())
         self.assertEqual(results[0][2], self.doc.generation)
         self.doc.close()
+
+    def test_saved_native_annotations_render_on_reopen_without_editable_import(self):
+        self.open_reader(self.one)
+        source_reader = PdfReader(self.one, strict=True)
+        geometry = PageGeometry.from_page(source_reader.pages[0], self.doc.page_sizes[0])
+        generation = self.doc.generation
+        region = tuple(geometry.pdf_to_qt(point) for point in
+                       ((100, 500), (150, 500), (150, 480), (100, 480), (100, 500)))
+        annotations = [
+            Note("reopened-note", "note", 0, generation,
+                 geometry.pdf_to_qt((200, 300)), "Saved note"),
+            *(Markup(f"reopened-{kind}", kind, 0, generation, (region,), "Selected words")
+              for kind in ("highlight", "underline", "strikeout")),
+            Ink("reopened-ink", "ink", 0, generation,
+                tuple(geometry.pdf_to_qt(point)
+                      for point in ((200, 350), (220, 370), (240, 360))), 2.5),
+        ]
+
+        for annotation in annotations:
+            with self.subTest(annotation=annotation.kind):
+                output = Path(self.temp.name) / f"saved-{annotation.kind}.pdf"
+                result = write_annotated_pdf(self.one, output, (annotation,))
+                self.assertTrue(result.success, result.error)
+                self.assertIsNone(self.doc.open(output))
+                self.app.processEvents()
+                self.assertEqual(self.reader.annotations.items, ())
+                self.assertFalse(self.reader.edit_note_action.isEnabled())
+
+                self.reader._request_visible_pages()
+                loop = QEventLoop()
+                poll = QTimer()
+                poll.setInterval(10)
+                poll.timeout.connect(
+                    lambda: loop.quit()
+                    if (self.reader.page_image(0) is not None
+                        and self.reader.thumbnail_image(0) is not None) else None)
+                timeout = QTimer()
+                timeout.setSingleShot(True)
+                timeout.timeout.connect(loop.quit)
+                poll.start()
+                timeout.start(5000)
+                if (self.reader.page_image(0) is None
+                        or self.reader.thumbnail_image(0) is None):
+                    loop.exec()
+                poll.stop()
+                timeout.stop()
+
+                page_image = self.reader.page_image(0)
+                thumbnail_image = self.reader.thumbnail_image(0)
+                self.assertIsNotNone(page_image, "page render did not complete")
+                self.assertIsNotNone(thumbnail_image, "thumbnail render did not complete")
+                base_page = self.doc.pdf.render(0, page_image.size())
+                base_thumbnail = self.doc.pdf.render(0, thumbnail_image.size())
+                self.assertFalse(base_page.isNull())
+                self.assertFalse(base_thumbnail.isNull())
+                self.assertNotEqual(hashlib.sha256(bytes(page_image.constBits())).digest(),
+                                    hashlib.sha256(bytes(base_page.constBits())).digest())
+                self.assertNotEqual(
+                    hashlib.sha256(bytes(thumbnail_image.constBits())).digest(),
+                    hashlib.sha256(bytes(base_thumbnail.constBits())).digest())
 
     def test_render_cache_rejects_stale_zoom_revision(self):
         self.open_reader()

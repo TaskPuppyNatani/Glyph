@@ -7,11 +7,12 @@ The original source remains active and unchanged. Save As asks for explicit
 confirmation before replacing an existing destination; cancel leaves it
 untouched. Replacement is an opt-in writer argument, and callers that do not
 provide a prepared confirmation target retain the no-overwrite default. Glyph
-does not yet import saved PDF annotations when reopening a copy. The writer
-accepts a source path, destination path, and immutable snapshot of Glyph
-annotations. It refuses encrypted PDFs and known signature markers, writes into
-a private staging directory beside the destination, validates the retained
-output file with pypdf and QtPdf, then publishes it.
+displays supported native PDF annotations when reopening a copy, including
+annotations previously written by Save As. It does not import them as editable
+Glyph records. The writer accepts a source path, destination path, and immutable
+snapshot of Glyph annotations. It refuses encrypted PDFs and known signature
+markers, writes into a private staging directory beside the destination,
+validates the retained output file with pypdf and QtPdf, then publishes it.
 
 ## Coordinates and markup appearance
 
@@ -132,13 +133,17 @@ published file. This check does not eliminate the directory-redirection race.
 
 ## Rendering and preservation limits
 
-QtPdf's base-page rendering keeps native annotation rendering disabled. While a
-document is open, Glyph's current in-memory overlays remain the visible source
-of annotations. Enabling QtPdf's annotation flag while drawing those overlays
-would draw annotations twice. A future PDF import/display path must choose one
-representation: import native annotations as Glyph overlays and keep the flag
-off, or render native annotations and suppress matching overlays. This
-milestone does not change reader rendering or add PDF annotation import.
+Glyph requests QtPdf's annotation render flag for both reader pages and
+thumbnails. QtPdf displays the native annotation types and appearance streams it
+supports, including saved highlights, underline, strikeout, ink, and text notes
+where supported by QtPdf. Glyph still draws newly created session annotations
+using its overlay system. On document open, the native annotations are not
+converted into Glyph records: they are view-only and are not available to
+Glyph's selection, movement, edit, delete, undo, or redo controls. This keeps
+native annotations from being drawn a second time as Glyph overlays and avoids
+claiming edit support for PDF annotation types Glyph cannot represent. Save As
+continues to write only the current Glyph annotation snapshot while preserving
+the source PDF's native annotations.
 
 Encrypted PDFs are rejected; no password or re-encryption policy is provided.
 Known signatures are detected from signature fields, signature dictionaries,

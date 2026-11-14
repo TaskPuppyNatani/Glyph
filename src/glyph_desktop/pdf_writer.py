@@ -1,10 +1,8 @@
 """Safe internal PDF annotation writer boundary.
 
-QtPdf remains Glyph's base-page renderer with native annotation rendering off.
-The current in-memory Glyph overlays are the only visible annotation source in
-an open session. A future import/display path must either map native objects to
-Glyph overlays while keeping the Qt annotation flag off, or enable native
-rendering and suppress matching overlays; enabling both would draw twice.
+The reader renders supported native PDF annotations with QtPdf. Glyph's
+editable session annotations remain separate overlay records; native PDF
+annotations are not imported into that editable collection.
 """
 
 from dataclasses import dataclass
