@@ -215,8 +215,16 @@ class SaveAsTests(unittest.TestCase):
         self.assertEqual(len(saved.pages), 3)
         saved_annotations = saved.pages[0].get("/Annots", []).get_object()
         self.assertEqual(len(saved_annotations), len(items))
-        information.assert_called_once()
-        warning.assert_not_called()
+        if os.name == "nt":
+            warning.assert_called_once()
+            information.assert_not_called()
+            warning_text = warning.call_args.args[2].lower()
+            self.assertIn(str(destination).lower(), warning_text)
+            self.assertIn("crash durability", warning_text)
+            self.assertIn("parent-directory flush", warning_text)
+        else:
+            information.assert_called_once()
+            warning.assert_not_called()
 
         self.assertIs(self.window.document.pdf, pdf)
         self.assertEqual(self.window.document.path, source_path)
