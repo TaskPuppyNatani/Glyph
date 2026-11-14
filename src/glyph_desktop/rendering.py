@@ -5,7 +5,8 @@ from dataclasses import dataclass
 
 from PySide6.QtCore import QObject, QSize, Signal
 from PySide6.QtGui import QImage
-from PySide6.QtPdf import QPdfDocument, QPdfPageRenderer
+from PySide6.QtPdf import (QPdfDocument, QPdfDocumentRenderOptions,
+                           QPdfPageRenderer)
 
 
 @dataclass(frozen=True)
@@ -99,6 +100,9 @@ class PageRenderController(QObject):
         self._queue: list[RenderJob] = []
         self._active: RenderJob | None = None
         self._active_request = 0
+        self._render_options = QPdfDocumentRenderOptions()
+        self._render_options.setRenderFlags(
+            QPdfDocumentRenderOptions.RenderFlag.Annotations)
         self.renderer = QPdfPageRenderer(self)
         self.renderer.setRenderMode(QPdfPageRenderer.RenderMode.MultiThreaded)
         self.renderer.setDocument(document)
@@ -125,7 +129,8 @@ class PageRenderController(QObject):
             job = self._queue.pop(0)
             if job.identity not in self._desired:
                 continue
-            request = self.renderer.requestPage(job.page, job.pixel_size)
+            request = self.renderer.requestPage(
+                job.page, job.pixel_size, self._render_options)
             if not request:
                 return
             self._active = job

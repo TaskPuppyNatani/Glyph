@@ -1,7 +1,9 @@
 import ctypes
 import hashlib
+import math
 import os
 import stat
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,7 +22,9 @@ from pypdf.generic import (ArrayObject, DictionaryObject, FloatObject, NameObjec
 from glyph_desktop.annotations import Ink, Markup, Note
 from glyph_desktop.pdf_annotations import convert_annotation
 from glyph_desktop.pdf_geometry import GeometryError, PageGeometry
-from glyph_desktop.pdf_writer import (_create_private_stage, write_annotated_pdf)
+from glyph_desktop.pdf_writer import (_annotation_record, _create_private_stage,
+                                     _matches_annotation, prepare_replacement_target,
+                                     write_annotated_pdf)
 from test_links import write_link_pdf
 
 
@@ -483,6 +487,60 @@ class PersistenceFoundationTests(unittest.TestCase):
             finally:
                 document.close()
 
+    def test_writer_roundtrips_long_fractional_ink_at_pdf_number_precision(self):
+        source = _geometry_pdf(self.root / "fractional-ink-source.pdf")
+        source_bytes = source.read_bytes()
+        source_reader = PdfReader(source, strict=True)
+        geometry = PageGeometry.from_page(source_reader.pages[0], _qt_page_sizes(source)[0])
+        inks = tuple(
+            Ink(f"fractional-ink-{stroke}", "ink", 0, 1,
+                tuple((31.123456789 + stroke * 14.234567891 + index * 0.717391304
+                       + 1.7 * math.sin(index * 0.061 + stroke),
+                       105.987654321 + stroke * 25.345678912 + index * 0.091234567
+                       + 7.65 * math.sin(index * 0.083 + stroke))
+                      for index in range(301)),
+                2.5)
+            for stroke in range(3))
+        destination = self.root / "fractional-ink-output.pdf"
+
+        result = write_annotated_pdf(source, destination, inks)
+
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(result.output_path, destination)
+        self.assertTrue(result.published)
+        self.assertEqual(source.read_bytes(), source_bytes)
+        output = PdfReader(destination, strict=True)
+        saved = {str(reference.get_object().get("/NM")): reference.get_object()
+                 for reference in output.pages[0].get("/Annots", [])
+                 if reference.get_object().get("/NM")}
+        self.assertEqual(set(saved), {item.id for item in inks})
+
+        for item in inks:
+            with self.subTest(annotation=item.id):
+                expected = _annotation_record(0, convert_annotation(item, geometry))
+                actual = _annotation_record(0, saved[item.id])
+                self.assertTrue(_matches_annotation(actual, expected))
+                self.assertEqual(actual["rect"], tuple(
+                    float(FloatObject(value).myrepr()) for value in expected["rect"]))
+                self.assertEqual(actual["ink_list"][0], tuple(
+                    float(FloatObject(value).myrepr()) for value in expected["ink_list"][0]))
+
+                altered = dict(actual)
+                changed_stroke = list(actual["ink_list"][0])
+                changed_stroke[0] += 0.001
+                altered["ink_list"] = (tuple(changed_stroke), *actual["ink_list"][1:])
+                self.assertFalse(_matches_annotation(altered, expected))
+
+                missing = dict(actual)
+                del missing["ink_list"]
+                self.assertFalse(_matches_annotation(missing, expected))
+
+                malformed = dict(actual)
+                malformed["ink_list"] = (actual["ink_list"][0][:-1],)
+                self.assertFalse(_matches_annotation(malformed, expected))
+
+        self.assertEqual(list(self.root.glob(f".{destination.name}.glyph-stage-*")), [])
+
     def test_windows_absolute_rename_arguments_and_unicode(self):
         from glyph_desktop import pdf_writer
 
@@ -538,6 +596,37 @@ class PersistenceFoundationTests(unittest.TestCase):
                 self.assertEqual(buffer.raw[offset:offset + len(encoded)], encoded)
                 self.assertEqual(buffer.raw[offset + len(encoded):offset + len(encoded) + 2], b"\0\0")
                 self.assertGreaterEqual(ctypes.sizeof(buffer), ctypes.sizeof(pdf_writer._WindowsRenameInfo))
+
+    def test_windows_replace_buffer_uses_documented_posix_replace_flags(self):
+        from glyph_desktop import pdf_writer
+
+        path = "C:\\Glyph\\replace-résumé-🐾.pdf"
+        buffer = pdf_writer._windows_replace_buffer(path)
+        info = ctypes.cast(buffer, ctypes.POINTER(pdf_writer._WindowsRenameInfoEx)).contents
+        encoded = path.encode("utf-16-le")
+        offset = pdf_writer._WindowsRenameInfoEx.FileName.offset
+        self.assertEqual(info.Flags, 0x3)
+        self.assertIsNone(info.RootDirectory)
+        self.assertEqual(info.FileNameLength, len(encoded))
+        self.assertEqual(buffer.raw[offset:offset + len(encoded)], encoded)
+        self.assertEqual(buffer.raw[offset + len(encoded):offset + len(encoded) + 2], b"\0\0")
+        with self.assertRaisesRegex(ValueError, "absolute"):
+            pdf_writer._windows_replace_buffer("relative.pdf")
+
+        observed = {}
+
+        class Kernel:
+            def SetFileInformationByHandle(self, handle, info_class, pointer, size):
+                info = ctypes.cast(
+                    pointer, ctypes.POINTER(pdf_writer._WindowsRenameInfoEx)).contents
+                observed.update(handle=handle.value, info_class=info_class,
+                                flags=info.Flags, size=size)
+                return True
+
+        with patch.object(pdf_writer, "_windows_api", return_value=Kernel()):
+            pdf_writer._windows_replace_by_handle(42, path)
+        self.assertEqual(observed, {"handle": 42, "info_class": 22,
+                                    "flags": 0x3, "size": ctypes.sizeof(buffer)})
 
     def test_windows_destination_identity_check_closes_handle(self):
         from glyph_desktop import pdf_writer
@@ -610,6 +699,94 @@ class PersistenceFoundationTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIn("already exists", result.error)
         self.assertEqual(destination.read_bytes(), b"keep existing file")
+
+    def test_existing_destination_requires_prepared_opt_in_and_replaces_on_success(self):
+        source = _core_fixture(self.root / "replace-source.pdf")
+        source_bytes = source.read_bytes()
+        destination = _geometry_pdf(self.root / "replace-output.pdf")
+        old_bytes = destination.read_bytes()
+
+        default_result = write_annotated_pdf(source, destination, ())
+        self.assertFalse(default_result.success)
+        self.assertFalse(default_result.published)
+        self.assertEqual(destination.read_bytes(), old_bytes)
+
+        prepared = prepare_replacement_target(source, destination)
+        self.assertIsNotNone(prepared)
+        result = write_annotated_pdf(source, destination, (), replacement_target=prepared)
+
+        self.assertTrue(result.success, result.error)
+        self.assertTrue(result.published)
+        self.assertEqual(result.output_path, destination)
+        self.assertEqual(result.crash_durable, os.name != "nt")
+        self.assertEqual(source.read_bytes(), source_bytes)
+        self.assertNotEqual(destination.read_bytes(), old_bytes)
+        self.assertEqual(len(PdfReader(destination, strict=True).pages), 3)
+        self.assertEqual(list(self.root.glob(f".{destination.name}.glyph-stage-*")), [])
+
+    def test_replacement_validation_failure_preserves_existing_destination(self):
+        source = _core_fixture(self.root / "replace-fail-source.pdf")
+        source_bytes = source.read_bytes()
+        destination = _geometry_pdf(self.root / "replace-fail-output.pdf")
+        old_bytes = destination.read_bytes()
+        prepared = prepare_replacement_target(source, destination)
+        self.assertIsNotNone(prepared)
+
+        with patch("glyph_desktop.pdf_writer._validate_output",
+                   side_effect=ValueError("injected validation failure")):
+            result = write_annotated_pdf(source, destination, (),
+                                         replacement_target=prepared)
+
+        self.assertFalse(result.success)
+        self.assertFalse(result.published)
+        self.assertIsNone(result.output_path)
+        self.assertIn("injected validation failure", result.error)
+        self.assertEqual(destination.read_bytes(), old_bytes)
+        self.assertEqual(source.read_bytes(), source_bytes)
+        self.assertEqual(list(self.root.glob(f".{destination.name}.glyph-stage-*")), [])
+
+    def test_source_hard_link_cannot_be_prepared_for_replacement(self):
+        source = _core_fixture(self.root / "linked-source.pdf")
+        alias = self.root / "source-alias.pdf"
+        try:
+            os.link(source, alias)
+        except OSError as error:
+            self.skipTest(f"hard links unavailable: {error}")
+        with self.assertRaisesRegex(ValueError, "open source PDF"):
+            prepare_replacement_target(source, alias)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"),
+                         "uses Linux renameat2 exchange to inject a final-window race")
+    def test_replacement_race_restores_destination_that_changed_after_confirmation(self):
+        from glyph_desktop import pdf_writer
+
+        source = _core_fixture(self.root / "replace-race-source.pdf")
+        source_bytes = source.read_bytes()
+        destination = _geometry_pdf(self.root / "replace-race-output.pdf")
+        changed = _geometry_pdf(self.root / "concurrent-output.pdf")
+        changed_bytes = changed.read_bytes()
+        prepared = prepare_replacement_target(source, destination)
+        self.assertIsNotNone(prepared)
+        original_exchange = pdf_writer._rename_exchange
+        replaced = []
+
+        def change_target_then_exchange(source_fd, source_name, destination_fd, destination_name):
+            if not replaced:
+                os.replace(changed, destination)
+                replaced.append(True)
+            return original_exchange(source_fd, source_name, destination_fd, destination_name)
+
+        with patch.object(pdf_writer, "_rename_exchange", side_effect=change_target_then_exchange):
+            result = write_annotated_pdf(source, destination, (),
+                                         replacement_target=prepared)
+
+        self.assertFalse(result.success)
+        self.assertFalse(result.published)
+        self.assertIsNone(result.output_path)
+        self.assertIn("Destination changed after replacement was confirmed", result.error)
+        self.assertEqual(destination.read_bytes(), changed_bytes)
+        self.assertEqual(source.read_bytes(), source_bytes)
+        self.assertEqual(list(self.root.glob(f".{destination.name}.glyph-stage-*")), [])
 
     def test_destination_created_during_write_is_never_overwritten(self):
         source = _core_fixture(self.root / "source.pdf")
