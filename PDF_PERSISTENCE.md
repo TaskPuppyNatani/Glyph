@@ -1,11 +1,14 @@
-# PDF annotation persistence foundation
+# PDF annotation persistence and Save As
 
-This milestone adds an internal pypdf writer boundary. It does not add a Save
-command or import annotations from PDFs. The writer accepts a source path, a
-differently named destination path, and an immutable snapshot of Glyph annotations.
-It refuses encrypted PDFs and known signature markers, writes into a private
-staging directory beside the destination, validates the retained output file
-with pypdf and QtPdf, then publishes without replacing an existing destination.
+M3E1B introduced the internal pypdf writer boundary; that foundation did not add
+a GUI save command or import annotations from PDFs. M3E2 adds File → Save As,
+which writes the current generation's Glyph annotations to a separate PDF copy.
+The original source remains active and unchanged, and an existing destination is
+never replaced. Glyph does not yet import saved PDF annotations when reopening a
+copy. The writer accepts a source path, destination path, and immutable snapshot
+of Glyph annotations. It refuses encrypted PDFs and known signature markers,
+writes into a private staging directory beside the destination, validates the
+retained output file with pypdf and QtPdf, then publishes without replacement.
 
 ## Coordinates and markup appearance
 
@@ -89,8 +92,8 @@ no-replace rename semantics ([`SetFileInformationByHandle`](https://learn.micros
 The writer reports successful publication but sets `crash_durable=False` and
 returns a warning because this implementation does not have a supported
 parent-directory flush guarantee. A Linux-style directory `fsync` is not used
-on Windows. No native Windows runtime verification has been performed for this
-remediation.
+on Windows. The M3E1B writer was validated by its native Windows persistence
+suite; native Windows verification of the M3E2 Save As GUI remains outstanding.
 
 `WriteResult` distinguishes a published file from a guaranteed crash-durable
 directory entry. Cleanup failures are returned through the same result API;
@@ -125,5 +128,6 @@ The writer does not validate signatures, preserve certification permissions,
 support arbitrary tilted text quads, or promise preservation for every PDF
 feature. Successfully reopening a result with pypdf and QtPdf does not prove
 that all document features were preserved. AES handling, arbitrary document
-preservation, other PDF viewers, Windows runtime behavior, annotation import,
-and Save/Save As workflows remain outside this milestone.
+preservation, other PDF viewers, and annotation import remain outside this
+foundation. M3E1B did not include a Save As workflow; M3E2 adds the GUI copy
+workflow described above. Ordinary Save remains out of scope.

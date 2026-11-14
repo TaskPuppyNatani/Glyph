@@ -5,7 +5,7 @@ from pathlib import Path
 from PySide6.QtCore import QEvent, Qt, QTimer
 from PySide6.QtGui import QAction, QActionGroup, QKeySequence
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QFileDialog,
-                               QLabel, QLineEdit, QMainWindow, QMessageBox,
+                               QDialog, QLabel, QLineEdit, QMainWindow, QMessageBox,
                                QStackedWidget, QTextEdit, QPlainTextEdit, QVBoxLayout, QPushButton, QScrollArea,
                                QWidget, QMenu)
 
@@ -15,6 +15,7 @@ from .settings import Appearance
 from .theme import ThemeManager
 from .reader import Document, Reader
 from .document_state import DocumentState
+from .pdf_writer import write_annotated_pdf
 
 
 class MainWindow(QMainWindow):
@@ -54,7 +55,7 @@ class MainWindow(QMainWindow):
         edit.addAction(self.reader.copy_action)
         edit.addAction(self.reader.select_all_action)
         annotations = self.menuBar().addMenu("&Annotation")
-        annotations.addAction("Annotations are not saved").setEnabled(False)
+        annotations.addAction("Annotations are included with Save As…").setEnabled(False)
         annotations.addAction("Alt+click markup on links to select").setEnabled(False)
         annotations.addAction("Right-click a note to edit it").setEnabled(False)
         annotations.addSeparator()
@@ -87,6 +88,12 @@ class MainWindow(QMainWindow):
         open_action.setShortcut(QKeySequence.StandardKey.Open)
         open_action.triggered.connect(self.open_pdf)
         app_menu.addAction(open_action)
+        self.save_as_action = QAction("Save &As…", self)
+        self.save_as_action.setShortcut(QKeySequence.StandardKey.SaveAs)
+        self.save_as_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        self.save_as_action.setEnabled(False)
+        self.save_as_action.triggered.connect(self.save_as_pdf)
+        app_menu.addAction(self.save_as_action)
         self.close_action = QAction("&Close Document", self)
         self.close_action.triggered.connect(self.close_document)
         app_menu.addAction(self.close_action)
@@ -177,6 +184,74 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "Open PDF", "", "PDF files (*.pdf)")
         if path:
             self.open_document(path)
+
+    def save_as_pdf(self) -> None:
+        """Write an annotated copy while leaving the active source document untouched."""
+        source_path = self.document.path
+        if self.document.pdf is None or source_path is None:
+            return
+
+        generation = self.document.generation
+        dialog = QFileDialog(self, "Save Annotated PDF As", str(source_path.parent))
+        dialog.setOption(QFileDialog.Option.DontConfirmOverwrite, True)
+        dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
+        dialog.setFileMode(QFileDialog.FileMode.AnyFile)
+        dialog.setNameFilter("PDF files (*.pdf)")
+        dialog.setDefaultSuffix("pdf")
+        dialog.selectFile(f"{source_path.stem}-annotated.pdf")
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        selected_files = dialog.selectedFiles()
+        if not selected_files or not selected_files[0]:
+            return
+        if (self.document.pdf is None or self.document.generation != generation
+                or self.document.path != source_path):
+            QMessageBox.warning(
+                self, "Document Changed", "The active PDF changed while Save As was open. Nothing was saved.")
+            return
+
+        snapshot = tuple(item for item in self.reader.annotations.items
+                         if item.generation == generation)
+        result = write_annotated_pdf(source_path, Path(selected_files[0]), snapshot)
+        self._show_save_as_result(result)
+
+    def _show_save_as_result(self, result) -> None:
+        durability_warning = result.warning
+        if result.published and not result.crash_durable and not durability_warning:
+            durability_warning = (
+                "Crash durability of the destination file name is not guaranteed.")
+
+        if result.success:
+            if result.output_path is None:
+                QMessageBox.warning(
+                    self, "PDF Save Result Unverified",
+                    "The writer reported success but did not return a verified output path.")
+                return
+            message = f"Annotated copy saved to {result.output_path}."
+            if durability_warning:
+                QMessageBox.warning(
+                    self, "PDF Saved with Warning", f"{message}\n\n{durability_warning}")
+            else:
+                QMessageBox.information(self, "PDF Saved", message)
+            return
+
+        error = result.error or "The annotated PDF could not be saved."
+        if result.published:
+            if result.output_path is not None:
+                publication = f"A PDF was published at {result.output_path}."
+            else:
+                publication = (
+                    "Publication was reported, but the final file location could not be verified.")
+            message = f"{publication}\n\n{error}\n\nThe published file was left in place; Glyph did not retry."
+            if durability_warning:
+                message += f"\n\n{durability_warning}"
+            QMessageBox.warning(self, "PDF Published with Error", message)
+            return
+
+        QMessageBox.warning(
+            self, "Unable to Save PDF",
+            f"{error}\n\nGlyph does not replace the source or any existing file.")
 
     def startup(self, explicit=None):
         path = explicit if explicit is not None else self.state.last_document
@@ -290,6 +365,7 @@ class MainWindow(QMainWindow):
     def _document_changed(self):
         active = self.document.pdf is not None
         self.close_action.setEnabled(active)
+        self.save_as_action.setEnabled(active)
         self.sidebar_visibility_action.setEnabled(active)
         self.thumbnails_action.setEnabled(active)
         self.outline_action.setEnabled(active)
