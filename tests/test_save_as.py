@@ -10,7 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QCoreApplication, QEvent, QSettings, Qt
 from PySide6.QtGui import QPainter, QPdfWriter, QKeySequence
-from PySide6.QtWidgets import QApplication, QFileDialog, QDialog
+from PySide6.QtWidgets import QApplication, QFileDialog, QDialog, QMessageBox
 from pypdf import PdfReader
 
 from glyph_desktop.annotations import Annotations, Markup
@@ -166,7 +166,8 @@ class SaveAsTests(unittest.TestCase):
         self.assertEqual(dialog.name_filter, "PDF files (*.pdf)")
         self.assertEqual(dialog.default_suffix, "pdf")
         self.assertEqual(dialog.selected_file, "source-annotated.pdf")
-        information.assert_called_once()
+        information.assert_not_called()
+        self.assertIn(str(destination), self.window.statusBar().currentMessage())
 
     def test_real_save_writes_copy_and_preserves_active_document_state(self):
         self.open_source()
@@ -215,16 +216,9 @@ class SaveAsTests(unittest.TestCase):
         self.assertEqual(len(saved.pages), 3)
         saved_annotations = saved.pages[0].get("/Annots", []).get_object()
         self.assertEqual(len(saved_annotations), len(items))
-        if os.name == "nt":
-            warning.assert_called_once()
-            information.assert_not_called()
-            warning_text = warning.call_args.args[2].lower()
-            self.assertIn(str(destination).lower(), warning_text)
-            self.assertIn("crash durability", warning_text)
-            self.assertIn("parent-directory flush", warning_text)
-        else:
-            information.assert_called_once()
-            warning.assert_not_called()
+        information.assert_not_called()
+        warning.assert_not_called()
+        self.assertIn(str(destination), self.window.statusBar().currentMessage())
 
         self.assertIs(self.window.document.pdf, pdf)
         self.assertEqual(self.window.document.path, source_path)
@@ -240,24 +234,124 @@ class SaveAsTests(unittest.TestCase):
         self.assertEqual(self.window.state.last_document, last_document)
         self.assertEqual(self.window.state.documents, documents)
 
-    def test_same_source_and_existing_destination_are_not_overwritten(self):
+    def test_open_source_is_never_an_overwrite_target(self):
         self.open_source()
-        existing = self.root / "existing.pdf"
-        existing_bytes = b"leave this destination untouched"
-        existing.write_bytes(existing_bytes)
         source_bytes = self.source.read_bytes()
+        dialog, dialog_patch = self.file_dialog(self.source)
+        with (dialog_patch,
+              patch("glyph_desktop.window.QMessageBox.warning") as warning,
+              patch.object(self.window, "_confirm_replace_pdf") as confirm):
+            self.window.save_as_pdf()
+        warning.assert_called_once()
+        self.assertIn("source", warning.call_args.args[2].lower())
+        confirm.assert_not_called()
+        self.assertEqual(self.source.read_bytes(), source_bytes)
 
-        for destination in (self.source, existing):
-            with self.subTest(destination=destination.name):
-                dialog, dialog_patch = self.file_dialog(destination)
-                with (dialog_patch,
-                      patch("glyph_desktop.window.QMessageBox.warning") as warning):
-                    self.window.save_as_pdf()
-                warning.assert_called_once()
-                message = warning.call_args.args[2]
-                self.assertIn("does not replace", message)
-                self.assertEqual(self.source.read_bytes(), source_bytes)
-                self.assertEqual(existing.read_bytes(), existing_bytes)
+    def test_cancel_existing_destination_leaves_it_untouched(self):
+        self.open_source()
+        destination = self.root / "existing.pdf"
+        old_bytes = b"leave this destination untouched"
+        destination.write_bytes(old_bytes)
+        dialog, dialog_patch = self.file_dialog(destination)
+
+        with (dialog_patch,
+              patch.object(self.window, "_confirm_replace_pdf", return_value=False) as confirm,
+              patch("glyph_desktop.window.write_annotated_pdf") as writer,
+              patch("glyph_desktop.window.QMessageBox.warning") as warning,
+              patch("glyph_desktop.window.QMessageBox.information") as information):
+            self.window.save_as_pdf()
+
+        confirm.assert_called_once_with(destination)
+        writer.assert_not_called()
+        warning.assert_not_called()
+        information.assert_not_called()
+        self.assertEqual(destination.read_bytes(), old_bytes)
+
+    def test_confirmed_existing_destination_is_replaced_after_validation(self):
+        self.open_source()
+        destination = self.root / "replace-me.pdf"
+        make_pdf(destination, pages=1)
+        old_bytes = destination.read_bytes()
+        source_bytes = self.source.read_bytes()
+        note = self.window.reader.annotations.add_note(0, (50.0, 60.0), "Saved note")
+        dialog, dialog_patch = self.file_dialog(destination)
+
+        with (dialog_patch,
+              patch.object(self.window, "_confirm_replace_pdf", return_value=True) as confirm,
+              patch("glyph_desktop.window.QMessageBox.warning") as warning,
+              patch("glyph_desktop.window.QMessageBox.information") as information):
+            self.window.save_as_pdf()
+
+        confirm.assert_called_once_with(destination)
+        warning.assert_not_called()
+        information.assert_not_called()
+        self.assertNotEqual(destination.read_bytes(), old_bytes)
+        self.assertEqual(self.source.read_bytes(), source_bytes)
+        self.assertEqual(self.window.document.path, self.source.resolve())
+        saved = PdfReader(destination, strict=True)
+        self.assertEqual(len(saved.pages), 3)
+        self.assertIn(note.id, {
+            str(reference.get_object().get("/NM"))
+            for reference in saved.pages[0].get("/Annots", [])
+        })
+        self.assertIn(str(destination), self.window.statusBar().currentMessage())
+
+    def test_replace_confirmation_has_explicit_replace_and_cancel_buttons(self):
+        real_message_box = QMessageBox
+
+        class FakeMessageBox:
+            Icon = real_message_box.Icon
+            ButtonRole = real_message_box.ButtonRole
+            StandardButton = real_message_box.StandardButton
+
+            def __init__(self, parent):
+                FakeMessageBox.last = self
+                self.parent = parent
+                self.buttons = []
+                self.default = None
+                self.clicked = None
+
+            def setIcon(self, icon):
+                self.icon = icon
+
+            def setWindowTitle(self, title):
+                self.title = title
+
+            def setText(self, text):
+                self.text = text
+
+            def setInformativeText(self, text):
+                self.informative_text = text
+
+            def addButton(self, label, role=None):
+                button = (label, role)
+                self.buttons.append(button)
+                if label == "Replace":
+                    self.replace = button
+                else:
+                    self.cancel = button
+                return button
+
+            def setDefaultButton(self, button):
+                self.default = button
+
+            def exec(self):
+                self.clicked = self.cancel
+
+            def clickedButton(self):
+                return self.clicked
+
+        with patch("glyph_desktop.window.QMessageBox", FakeMessageBox):
+            self.assertFalse(self.window._confirm_replace_pdf(self.root / "existing.pdf"))
+
+        message = FakeMessageBox.last
+        self.assertEqual(message.title, "Replace Existing PDF?")
+        self.assertIn("fully written and validated", message.informative_text)
+        self.assertEqual(message.buttons, [
+            ("Replace", QMessageBox.ButtonRole.DestructiveRole),
+            (QMessageBox.StandardButton.Cancel, None),
+        ])
+        self.assertIs(message.default, message.cancel)
 
     def test_failure_before_publication_shows_error_and_preserves_document(self):
         self.open_source()
@@ -304,7 +398,7 @@ class SaveAsTests(unittest.TestCase):
                     self.assertIn("location could not be verified", message)
                 self.assertIn("did not retry", message)
 
-    def test_success_with_windows_durability_warning_is_not_reported_as_plain_success(self):
+    def test_success_with_windows_durability_warning_uses_status_bar(self):
         self.open_source()
         destination = self.root / "windows-copy.pdf"
         result = WriteResult(
@@ -318,10 +412,9 @@ class SaveAsTests(unittest.TestCase):
               patch("glyph_desktop.window.QMessageBox.information") as information):
             self.window.save_as_pdf()
 
-        warning.assert_called_once()
+        warning.assert_not_called()
         information.assert_not_called()
-        self.assertIn(str(destination), warning.call_args.args[2])
-        self.assertIn(result.warning, warning.call_args.args[2])
+        self.assertIn(str(destination), self.window.statusBar().currentMessage())
 
 
 if __name__ == "__main__":

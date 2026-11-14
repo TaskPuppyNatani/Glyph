@@ -4,10 +4,11 @@ Glyph is a local-first desktop PDF application in development for Windows and Li
 Glyph opens local PDFs in a continuous, vertically scrolling reader with page
 navigation, zoom, and a toggleable thumbnail sidebar. Text markup, freehand ink,
 and note annotations can be written to a separate PDF copy with File → Save As;
-the original stays open and existing files are never replaced. Glyph does not
-yet import saved PDF annotations when reopening that copy. PDF page-content
-editing and password-protected PDFs are not supported. QtPdf is installed with
-the application dependencies.
+the original stays open, and replacing an existing export requires explicit
+confirmation. The persistence writer otherwise refuses to replace existing
+files. Glyph does not yet import saved PDF annotations when reopening that
+copy. PDF page-content editing and password-protected PDFs are not supported.
+QtPdf is installed with the application dependencies.
 Glyph displays embedded PDF outlines as a hierarchical table of contents and
 navigates to their page and location destinations.
 Embedded internal PDF links are clickable; HTTP and HTTPS links open through

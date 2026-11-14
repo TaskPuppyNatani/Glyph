@@ -15,7 +15,7 @@ from .settings import Appearance
 from .theme import ThemeManager
 from .reader import Document, Reader
 from .document_state import DocumentState
-from .pdf_writer import write_annotated_pdf
+from .pdf_writer import prepare_replacement_target, write_annotated_pdf
 
 
 class MainWindow(QMainWindow):
@@ -213,8 +213,43 @@ class MainWindow(QMainWindow):
 
         snapshot = tuple(item for item in self.reader.annotations.items
                          if item.generation == generation)
-        result = write_annotated_pdf(source_path, Path(selected_files[0]), snapshot)
+        destination = Path(selected_files[0])
+        try:
+            replacement_target = prepare_replacement_target(source_path, destination)
+        except Exception as error:
+            QMessageBox.warning(
+                self, "Unable to Replace PDF",
+                f"Glyph could not safely prepare the selected destination:\n\n{error}")
+            return
+
+        if replacement_target is None:
+            result = write_annotated_pdf(source_path, destination, snapshot)
+        else:
+            if not self._confirm_replace_pdf(destination):
+                try:
+                    replacement_target.close()
+                except Exception as error:
+                    QMessageBox.warning(
+                        self, "Unable to Release PDF",
+                        f"Glyph could not release the selected destination:\n\n{error}")
+                return
+            result = write_annotated_pdf(
+                source_path, destination, snapshot, replacement_target=replacement_target)
         self._show_save_as_result(result)
+
+    def _confirm_replace_pdf(self, destination: Path) -> bool:
+        message = QMessageBox(self)
+        message.setIcon(QMessageBox.Icon.Warning)
+        message.setWindowTitle("Replace Existing PDF?")
+        message.setText(f"{destination.name} already exists.")
+        message.setInformativeText(
+            "Replace it with the annotated PDF? The existing file is kept unless "
+            "the new PDF is fully written and validated.")
+        replace_button = message.addButton("Replace", QMessageBox.ButtonRole.DestructiveRole)
+        cancel_button = message.addButton(QMessageBox.StandardButton.Cancel)
+        message.setDefaultButton(cancel_button)
+        message.exec()
+        return message.clickedButton() is replace_button
 
     def _show_save_as_result(self, result) -> None:
         durability_warning = result.warning
@@ -228,12 +263,7 @@ class MainWindow(QMainWindow):
                     self, "PDF Save Result Unverified",
                     "The writer reported success but did not return a verified output path.")
                 return
-            message = f"Annotated copy saved to {result.output_path}."
-            if durability_warning:
-                QMessageBox.warning(
-                    self, "PDF Saved with Warning", f"{message}\n\n{durability_warning}")
-            else:
-                QMessageBox.information(self, "PDF Saved", message)
+            self.statusBar().showMessage(f"Annotated PDF saved to {result.output_path}.", 6000)
             return
 
         error = result.error or "The annotated PDF could not be saved."
@@ -251,7 +281,7 @@ class MainWindow(QMainWindow):
 
         QMessageBox.warning(
             self, "Unable to Save PDF",
-            f"{error}\n\nGlyph does not replace the source or any existing file.")
+            f"{error}\n\nThe source PDF and existing destination were left untouched.")
 
     def startup(self, explicit=None):
         path = explicit if explicit is not None else self.state.last_document

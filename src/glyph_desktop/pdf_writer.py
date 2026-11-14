@@ -14,6 +14,7 @@ import ntpath
 import os
 from pathlib import Path
 import secrets
+import stat
 import sys
 import tempfile
 from typing import Iterable
@@ -42,6 +43,42 @@ class WriteResult:
     published: bool = False
     crash_durable: bool = False
     warning: str | None = None
+
+
+@dataclass
+class PreparedReplacement:
+    """One-use, confirmed existing destination held through publication."""
+    destination: Path
+    source_identity: tuple
+    destination_identity: tuple
+    destination_state: tuple | None = None
+    parent_identity: tuple | None = None
+    parent_fd: int | None = None
+    target_fd: int | None = None
+    target_handle: int | None = None
+    _closed: bool = False
+
+    def close(self):
+        if self._closed:
+            return
+        errors = []
+        for attribute in ("target_fd", "parent_fd"):
+            descriptor = getattr(self, attribute)
+            if descriptor is not None:
+                setattr(self, attribute, None)
+                try:
+                    os.close(descriptor)
+                except Exception as error:
+                    errors.append(error)
+        if self.target_handle is not None:
+            handle = self.target_handle
+            self.target_handle = None
+            if not _windows_api().CloseHandle(handle):
+                errors.append(ctypes.WinError(ctypes.get_last_error()))
+        self._closed = True
+        if errors:
+            raise OSError("Could not close prepared replacement handle: "
+                          + "; ".join(str(error) for error in errors))
 
 
 def _qt_page_sizes(path: Path):
@@ -237,6 +274,13 @@ class _WindowsRenameInfo(ctypes.Structure):
                 ("FileName", ctypes.c_uint16 * 1)]
 
 
+class _WindowsRenameInfoEx(ctypes.Structure):
+    _fields_ = [("Flags", ctypes.c_uint32),
+                ("RootDirectory", ctypes.c_void_p),
+                ("FileNameLength", ctypes.c_uint32),
+                ("FileName", ctypes.c_uint16 * 1)]
+
+
 def _windows_rename_buffer(destination_name: str):
     drive, _ = ntpath.splitdrive(destination_name)
     if not ntpath.isabs(destination_name) or not drive:
@@ -257,6 +301,26 @@ def _windows_rename_buffer(destination_name: str):
     return buffer
 
 
+def _windows_replace_buffer(destination_name: str):
+    drive, _ = ntpath.splitdrive(destination_name)
+    if not ntpath.isabs(destination_name) or not drive:
+        raise ValueError("Windows destination must be an absolute path")
+    if drive.startswith("\\\\") and not (drive.startswith("\\\\?\\")
+                                              and len(drive) == 6 and drive[5] == ":"):
+        raise ValueError("Windows network or device destination paths are unsupported")
+    encoded = destination_name.encode("utf-16-le")
+    buffer_size = max(ctypes.sizeof(_WindowsRenameInfoEx),
+                      _WindowsRenameInfoEx.FileName.offset + len(encoded) + 2)
+    buffer = ctypes.create_string_buffer(buffer_size)
+    info = ctypes.cast(buffer, ctypes.POINTER(_WindowsRenameInfoEx)).contents
+    info.Flags = 0x1 | 0x2  # FILE_RENAME_REPLACE_IF_EXISTS | POSIX_SEMANTICS
+    info.RootDirectory = None
+    info.FileNameLength = len(encoded)
+    ctypes.memmove(ctypes.addressof(buffer) + _WindowsRenameInfoEx.FileName.offset,
+                   encoded, len(encoded))
+    return buffer
+
+
 def _windows_publish_by_handle(file_handle, destination_name: str):
     """Atomically rename the validated handle without replacing a target."""
     from ctypes import wintypes
@@ -273,6 +337,18 @@ def _windows_publish_by_handle(file_handle, destination_name: str):
         raise ctypes.WinError(code)
 
 
+def _windows_replace_by_handle(file_handle, destination_name: str):
+    """Replace a locked, confirmed target with the validated handle."""
+    from ctypes import wintypes
+
+    kernel = _windows_api()
+    buffer = _windows_replace_buffer(destination_name)
+    if not kernel.SetFileInformationByHandle(
+            wintypes.HANDLE(file_handle), 22, ctypes.cast(buffer, ctypes.c_void_p),
+            ctypes.sizeof(buffer)):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
 class _WindowsFileInformation(ctypes.Structure):
     _fields_ = [(name, ctypes.c_uint32) for name in (
         "attributes", "creation_low", "creation_high", "access_low", "access_high",
@@ -284,6 +360,60 @@ class _WindowsFileId(ctypes.Structure):
     _fields_ = [("volume_serial", ctypes.c_uint64), ("file_id", ctypes.c_ubyte * 16)]
 
 
+def _windows_file_identity(file_handle):
+    from ctypes import wintypes
+
+    info = _WindowsFileId()
+    if not _windows_api().GetFileInformationByHandleEx(
+            wintypes.HANDLE(file_handle), 18, ctypes.byref(info), ctypes.sizeof(info)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return info.volume_serial, bytes(info.file_id)
+
+
+def _windows_path_identity(path, *, share_mode=0x7, open_reparse=False):
+    from ctypes import wintypes
+
+    kernel = _windows_api()
+    flags = 0x00200000 if open_reparse else 0
+    handle = kernel.CreateFileW(str(path), 0x80, share_mode, None, 3, flags, None)
+    if handle == wintypes.HANDLE(-1).value:
+        code = ctypes.get_last_error()
+        if code in (2, 3):
+            return None, None
+        raise ctypes.WinError(code)
+    try:
+        attributes = _WindowsFileInformation()
+        if not kernel.GetFileInformationByHandle(wintypes.HANDLE(handle),
+                                                  ctypes.byref(attributes)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return _windows_file_identity(handle), attributes.attributes
+    finally:
+        kernel.CloseHandle(wintypes.HANDLE(handle))
+
+
+def _open_windows_replacement_target(path):
+    from ctypes import wintypes
+
+    kernel = _windows_api()
+    handle = kernel.CreateFileW(str(path), 0x80, 0x1, None, 3, 0x00200000, None)
+    if handle == wintypes.HANDLE(-1).value:
+        code = ctypes.get_last_error()
+        if code in (2, 3):
+            return None
+        raise ctypes.WinError(code)
+    try:
+        attributes = _WindowsFileInformation()
+        if not kernel.GetFileInformationByHandle(wintypes.HANDLE(handle),
+                                                  ctypes.byref(attributes)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if attributes.attributes & (0x10 | 0x400):
+            raise ValueError("Replacement target must be a regular file, not a directory or reparse point")
+        return handle, _windows_file_identity(handle)
+    except Exception:
+        kernel.CloseHandle(wintypes.HANDLE(handle))
+        raise
+
+
 def _windows_verify_published_file(file_handle, destination_name: str):
     """Compare the named entry with the still-open validated file handle."""
     from ctypes import wintypes
@@ -293,17 +423,11 @@ def _windows_verify_published_file(file_handle, destination_name: str):
     if target == wintypes.HANDLE(-1).value:
         raise ctypes.WinError(ctypes.get_last_error())
     try:
-        expected, actual = _WindowsFileId(), _WindowsFileId()
         attrs = _WindowsFileInformation()
         if not kernel.GetFileInformationByHandle(wintypes.HANDLE(target), ctypes.byref(attrs)):
             raise ctypes.WinError(ctypes.get_last_error())
-        for handle, info in ((file_handle, expected), (target, actual)):
-            if not kernel.GetFileInformationByHandleEx(wintypes.HANDLE(handle), 18,
-                                                       ctypes.byref(info), ctypes.sizeof(info)):
-                raise ctypes.WinError(ctypes.get_last_error())
-        if (attrs.attributes & 0x400 or not any(expected.file_id) or
-                (actual.volume_serial, bytes(actual.file_id)) !=
-                (expected.volume_serial, bytes(expected.file_id))):
+        expected, actual = (_windows_file_identity(handle) for handle in (file_handle, target))
+        if (attrs.attributes & 0x400 or not any(expected[1]) or actual != expected):
             raise ValueError("Intended destination does not identify the validated file")
     finally:
         kernel.CloseHandle(target)
@@ -312,6 +436,114 @@ def _windows_verify_published_file(file_handle, destination_name: str):
 def _open_posix_directory(path: Path) -> int:
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
     return os.open(path, flags)
+
+
+def _posix_identity(info):
+    return info.st_dev, info.st_ino
+
+
+def _posix_state(info):
+    return (info.st_dev, info.st_ino, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns)
+
+
+def prepare_replacement_target(source_path, destination_path) -> PreparedReplacement | None:
+    """Pin an existing regular destination before asking the user to replace it.
+
+    The returned one-use token must be passed to ``write_annotated_pdf`` only
+    after explicit user confirmation. A missing destination returns ``None``;
+    the normal writer path will then retain its no-overwrite behavior.
+    """
+    source = Path(source_path).expanduser()
+    requested_destination = Path(destination_path).expanduser()
+    if not source.is_file():
+        raise ValueError("Source PDF does not exist or is not a regular file")
+    source_resolved = source.resolve(strict=True)
+    if not requested_destination.name or requested_destination.name in (".", ".."):
+        raise ValueError("Destination must name a file")
+    if not requested_destination.parent.is_dir():
+        raise ValueError("Destination directory does not exist")
+    destination_parent = requested_destination.parent.resolve(strict=True)
+    destination = destination_parent / requested_destination.name
+    if source_resolved == destination.resolve(strict=False):
+        raise ValueError("Source and destination paths must be different")
+
+    if os.name == "nt":
+        source_identity, _ = _windows_path_identity(source_resolved)
+        if source_identity is None:
+            raise ValueError("Source PDF is no longer available")
+        target = _open_windows_replacement_target(destination)
+        if target is None:
+            return None
+        handle, destination_identity = target
+        if source_identity == destination_identity:
+            _windows_api().CloseHandle(handle)
+            raise ValueError("Destination identifies the open source PDF and cannot be replaced")
+        return PreparedReplacement(destination, source_identity, destination_identity,
+                                  target_handle=handle)
+
+    if not sys.platform.startswith("linux"):
+        raise OSError("Safe destination replacement is supported on Linux and Windows only")
+
+    source_info = os.stat(source_resolved)
+    parent_fd = _open_posix_directory(destination_parent)
+    target_fd = None
+    try:
+        path_flags = getattr(os, "O_PATH", 0) | getattr(os, "O_NOFOLLOW", 0)
+        path_flags |= getattr(os, "O_CLOEXEC", 0)
+        if not getattr(os, "O_PATH", 0):
+            raise OSError(errno.ENOTSUP, "O_PATH is required to pin a replacement target")
+        try:
+            target_fd = os.open(destination.name, path_flags, dir_fd=parent_fd)
+        except FileNotFoundError:
+            return None
+        target_info = os.fstat(target_fd)
+        if not stat.S_ISREG(target_info.st_mode):
+            raise ValueError("Replacement target must be a regular file, not a directory or symlink")
+        if _posix_identity(source_info) == _posix_identity(target_info):
+            raise ValueError("Destination identifies the open source PDF and cannot be replaced")
+        parent_identity = _posix_identity(os.fstat(parent_fd))
+        prepared = PreparedReplacement(
+            destination, _posix_identity(source_info), _posix_identity(target_info),
+            destination_state=_posix_state(target_info), parent_identity=parent_identity,
+            parent_fd=parent_fd, target_fd=target_fd)
+        parent_fd = target_fd = None
+        return prepared
+    finally:
+        if target_fd is not None:
+            os.close(target_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
+
+
+def _verify_prepared_replacement(source, destination, prepared: PreparedReplacement):
+    if (not isinstance(prepared, PreparedReplacement) or prepared._closed
+            or prepared.destination != destination):
+        raise ValueError("Prepared replacement does not match this destination")
+    if os.name == "nt":
+        source_identity, _ = _windows_path_identity(source)
+        target_identity, attributes = _windows_path_identity(destination, open_reparse=True)
+        if (attributes is None or attributes & (0x10 | 0x400)
+                or source_identity != prepared.source_identity
+                or target_identity != prepared.destination_identity
+                or _windows_file_identity(prepared.target_handle) != prepared.destination_identity):
+            raise FileExistsError("Destination changed since replacement was confirmed")
+        return
+
+    source_info = os.stat(source)
+    parent_info = os.fstat(prepared.parent_fd)
+    target_info = os.fstat(prepared.target_fd)
+    try:
+        path_info = os.stat(destination.name, dir_fd=prepared.parent_fd,
+                            follow_symlinks=False)
+    except FileNotFoundError as error:
+        raise FileExistsError("Destination changed since replacement was confirmed") from error
+    if (not stat.S_ISREG(target_info.st_mode) or not stat.S_ISREG(path_info.st_mode)
+            or _posix_identity(source_info) != prepared.source_identity
+            or _posix_identity(parent_info) != prepared.parent_identity
+            or _posix_state(target_info) != prepared.destination_state
+            or _posix_state(path_info) != prepared.destination_state):
+        raise FileExistsError("Destination changed since replacement was confirmed")
 
 
 def _link_fd_noclobber(file_descriptor: int, stage_name: str, stage_fd: int,
@@ -347,6 +579,77 @@ def _link_fd_noclobber(file_descriptor: int, stage_name: str, stage_fd: int,
                       "Validated staging file is no longer linkable; refusing to publish a replacement",
                       destination_name)
     raise OSError(code, os.strerror(code), destination_name)
+
+
+def _rename_exchange(source_fd: int, source_name: str,
+                     destination_fd: int, destination_name: str):
+    """Atomically exchange two entries; unsupported filesystems fail closed."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise OSError(errno.ENOSYS, "renameat2 is unavailable; refusing unsafe replacement")
+    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
+                          ctypes.c_char_p, ctypes.c_uint]
+    renameat2.restype = ctypes.c_int
+    if renameat2(source_fd, os.fsencode(source_name), destination_fd,
+                 os.fsencode(destination_name), 0x2) != 0:  # RENAME_EXCHANGE
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code), destination_name)
+
+
+def _linux_replace_by_exchange(file_descriptor, temporary_name, stage_fd,
+                               destination_name, destination_fd, prepared,
+                               source, temporary_path, publication_state):
+    _verify_prepared_replacement(source, prepared.destination, prepared)
+    _rename_exchange(stage_fd, temporary_name, destination_fd, destination_name)
+    publication_state.update(published=True, destination_verified=False,
+                             preserve_stage=True)
+    changed = False
+    try:
+        displaced = os.stat(temporary_name, dir_fd=stage_fd, follow_symlinks=False)
+        current = os.stat(destination_name, dir_fd=destination_fd, follow_symlinks=False)
+        validated = os.fstat(file_descriptor)
+        displaced_state = _posix_state(displaced)
+        # RENAME_EXCHANGE updates the displaced inode's ctime on Linux, so
+        # compare its stable identity and content timestamps here. The full
+        # state, including ctime, was checked immediately before publication.
+        changed = (_posix_identity(displaced) != prepared.destination_identity
+                   or displaced_state[2:4] != prepared.destination_state[2:4]
+                   or not stat.S_ISREG(current.st_mode)
+                   or _posix_identity(current) != _posix_identity(validated))
+        if changed:
+            raise FileExistsError("Destination changed after replacement was confirmed")
+    except Exception as error:
+        try:
+            _rename_exchange(stage_fd, temporary_name, destination_fd, destination_name)
+        except Exception as rollback_error:
+            try:
+                current = os.stat(destination_name, dir_fd=destination_fd,
+                                  follow_symlinks=False)
+                publication_state["destination_verified"] = (
+                    stat.S_ISREG(current.st_mode)
+                    and _posix_identity(current) == _posix_identity(os.fstat(file_descriptor)))
+            except Exception:
+                publication_state["destination_verified"] = False
+            raise RuntimeError(
+                "Replacement state is ambiguous; the previous destination and validated "
+                f"output are retained in {temporary_path.parent}: "
+                f"{rollback_error}") from error
+        publication_state.update(published=False, destination_verified=False,
+                                 preserve_stage=False)
+        try:
+            os.fsync(destination_fd)
+            os.fsync(stage_fd)
+        except Exception as sync_error:
+            raise RuntimeError(
+                "The previous destination was restored, but rollback directory sync failed: "
+                f"{sync_error}") from error
+        if changed:
+            raise FileExistsError(
+                "Destination changed after replacement was confirmed; the previous entry was restored")
+        raise RuntimeError(f"Replacement verification failed; the previous entry was restored: {error}") from error
+    publication_state.update(published=True, destination_verified=True,
+                             preserve_stage=False)
 
 
 def _page_box(page, name):
@@ -453,14 +756,16 @@ def _cleanup_stage_directory(path: Path | None):
         path.rmdir()
 
 
-def write_annotated_pdf(source_path, destination_path,
-                        annotations: Iterable) -> WriteResult:
-    """Write and validate annotations, then publish without replacing a target.
+def write_annotated_pdf(source_path, destination_path, annotations: Iterable, *,
+                        replacement_target: PreparedReplacement | None = None) -> WriteResult:
+    """Write and validate annotations before safely publishing the retained file.
 
-    Linux publication links the retained validated file descriptor and fsyncs
-    the destination directory. Windows publication renames the retained file
-    handle with ReplaceIfExists disabled; file contents are flushed, while
-    parent-directory crash durability is explicitly not guaranteed.
+    Existing destinations are rejected unless the caller supplies a prepared,
+    one-use target after explicit confirmation. Linux replacement uses an
+    atomic exchange and verifies the displaced file before discarding it.
+    Windows replacement uses the documented handle-based POSIX rename mode and
+    holds the confirmed target against writes and deletion. Windows file
+    contents are flushed, but parent-directory crash durability is not promised.
     """
     stage_directory = temporary = destination = None
     stream = None
@@ -469,6 +774,8 @@ def write_annotated_pdf(source_path, destination_path,
     error_text = None
     cleanup_errors = []
     published = crash_durable = destination_verified = False
+    publication_state = {"published": False, "destination_verified": False,
+                          "preserve_stage": False}
     warning = None
 
     try:
@@ -485,10 +792,12 @@ def write_annotated_pdf(source_path, destination_path,
         destination = destination_parent / requested_destination.name
         if source_resolved == destination.resolve(strict=False):
             raise ValueError("Source and destination paths must be different")
-        if destination.exists() or destination.is_symlink():
+        if replacement_target is None and (destination.exists() or destination.is_symlink()):
             raise FileExistsError("Destination already exists; it will not be overwritten")
         if os.name != "nt" and not sys.platform.startswith("linux"):
             raise OSError("Safe descriptor-based publication is not supported on this platform")
+        if replacement_target is not None:
+            _verify_prepared_replacement(source_resolved, destination, replacement_target)
 
         snapshot = tuple(annotations)
         generations = {item.generation for item in snapshot}
@@ -528,10 +837,20 @@ def write_annotated_pdf(source_path, destination_path,
         if os.name == "nt":
             unowned_descriptor = _create_windows_stage_fd(temporary)
         else:
-            unowned_descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_RDWR
-                                         | getattr(os, "O_CLOEXEC", 0), 0o600)
             stage_fd = _open_posix_directory(stage_directory)
-            destination_fd = _open_posix_directory(destination_parent)
+            if replacement_target is not None:
+                destination_fd = os.dup(replacement_target.parent_fd)
+                stage_parent_info = os.stat(stage_directory.parent)
+                if _posix_identity(stage_parent_info) != replacement_target.parent_identity:
+                    raise FileExistsError(
+                        "Destination directory changed since replacement was confirmed")
+                unowned_descriptor = os.open(
+                    temporary.name, os.O_CREAT | os.O_EXCL | os.O_RDWR
+                    | getattr(os, "O_CLOEXEC", 0), 0o600, dir_fd=stage_fd)
+            else:
+                unowned_descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_RDWR
+                                             | getattr(os, "O_CLOEXEC", 0), 0o600)
+                destination_fd = _open_posix_directory(destination_parent)
 
         # Qt and pypdf share this descriptor sequentially; avoid buffered
         # file-position state while retaining the publication handle.
@@ -541,11 +860,17 @@ def write_annotated_pdf(source_path, destination_path,
         stream.flush()
         os.fsync(stream.fileno())
         _validate_output(reader, stream, expected)
+        if replacement_target is not None:
+            _verify_prepared_replacement(source_resolved, destination, replacement_target)
 
         if os.name == "nt":
             import msvcrt
-            _windows_publish_by_handle(msvcrt.get_osfhandle(stream.fileno()), str(destination))
+            if replacement_target is None:
+                _windows_publish_by_handle(msvcrt.get_osfhandle(stream.fileno()), str(destination))
+            else:
+                _windows_replace_by_handle(msvcrt.get_osfhandle(stream.fileno()), str(destination))
             published = True
+            publication_state.update(published=True, destination_verified=False)
             warning = WINDOWS_DURABILITY_WARNING
             try:
                 _windows_verify_published_file(msvcrt.get_osfhandle(stream.fileno()), str(destination))
@@ -553,15 +878,32 @@ def write_annotated_pdf(source_path, destination_path,
                 raise RuntimeError(f"PDF was published, but its destination could not be verified; "
                                    f"actual location is unknown: {error}") from error
             destination_verified = True
+            publication_state["destination_verified"] = True
         else:
-            _link_fd_noclobber(stream.fileno(), temporary.name, stage_fd,
-                               destination.name, destination_fd)
-            published = True
-            destination_verified = True
+            if replacement_target is None:
+                _link_fd_noclobber(stream.fileno(), temporary.name, stage_fd,
+                                   destination.name, destination_fd)
+                published = True
+                destination_verified = True
+                publication_state.update(published=True, destination_verified=True)
+            else:
+                _linux_replace_by_exchange(
+                    stream.fileno(), temporary.name, stage_fd, destination.name,
+                    destination_fd, replacement_target, source_resolved, temporary,
+                    publication_state)
+                published = publication_state["published"]
+                destination_verified = publication_state["destination_verified"]
             os.fsync(destination_fd)
             crash_durable = True
+            if replacement_target is not None:
+                os.fsync(stage_fd)
+                os.unlink(temporary.name, dir_fd=stage_fd)
+                temporary = None
+                os.fsync(stage_fd)
     except Exception as error:
         error_text = f"{type(error).__name__}: {error}"
+        published = publication_state["published"]
+        destination_verified = publication_state["destination_verified"]
 
     if unowned_descriptor is not None:
         try:
@@ -580,19 +922,26 @@ def write_annotated_pdf(source_path, destination_path,
                 os.close(descriptor)
             except Exception as error:
                 cleanup_errors.append(f"close {label}: {type(error).__name__}: {error}")
-    if not (os.name == "nt" and published):
+    if not publication_state["preserve_stage"] and not (os.name == "nt" and published):
         try:
             _cleanup_staged_file(temporary)
         except Exception as error:
             cleanup_errors.append(f"remove staged output: {type(error).__name__}: {error}")
-    try:
-        _cleanup_stage_directory(stage_directory)
-    except Exception as error:
-        cleanup_errors.append(f"remove staging directory: {type(error).__name__}: {error}")
+    if not publication_state["preserve_stage"]:
+        try:
+            _cleanup_stage_directory(stage_directory)
+        except Exception as error:
+            cleanup_errors.append(f"remove staging directory: {type(error).__name__}: {error}")
 
     if cleanup_errors:
         cleanup_text = "Cleanup failed: " + "; ".join(cleanup_errors)
         error_text = f"{error_text}; {cleanup_text}" if error_text else cleanup_text
+    if replacement_target is not None:
+        try:
+            replacement_target.close()
+        except Exception as error:
+            cleanup_text = f"close replacement target: {type(error).__name__}: {error}"
+            error_text = f"{error_text}; {cleanup_text}" if error_text else cleanup_text
     success = error_text is None
     return WriteResult(success, destination if published and destination_verified else None, error_text,
                        published, crash_durable, warning)
