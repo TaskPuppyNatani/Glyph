@@ -15,7 +15,8 @@ from .settings import Appearance
 from .theme import ThemeManager
 from .reader import Document, Reader
 from .document_state import DocumentState
-from .pdf_writer import prepare_replacement_target, write_annotated_pdf
+from .pdf_writer import (prepare_replacement_target, write_annotated_pdf,
+                         stage_annotated_pdf, publish_prepared_pdf)
 
 
 class MainWindow(QMainWindow):
@@ -88,6 +89,12 @@ class MainWindow(QMainWindow):
         open_action.setShortcut(QKeySequence.StandardKey.Open)
         open_action.triggered.connect(self.open_pdf)
         app_menu.addAction(open_action)
+        self.save_action = QAction("&Save", self)
+        self.save_action.setShortcut(QKeySequence.StandardKey.Save)
+        self.save_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        self.save_action.setEnabled(False)
+        self.save_action.triggered.connect(self.save_pdf)
+        app_menu.addAction(self.save_action)
         self.save_as_action = QAction("Save &As…", self)
         self.save_as_action.setShortcut(QKeySequence.StandardKey.SaveAs)
         self.save_as_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
@@ -184,6 +191,82 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "Open PDF", "", "PDF files (*.pdf)")
         if path:
             self.open_document(path)
+
+    def save_pdf(self) -> None:
+        """Save current session annotations to the open PDF."""
+        if self.document.pdf is None or self.document.path is None:
+            return
+        if self.reader.pending_session_recovery is not None:
+            QMessageBox.warning(self, "Unable to Save PDF", "A previous session is awaiting recovery.")
+            return
+        annotations = self.reader.annotations.items
+        if not annotations:
+            self.statusBar().showMessage("No new annotations to save.", 6000)
+            return
+        recovery = None
+        prepared = None
+        published = False
+        ambiguous = False
+        release_started = False
+        self._restoring = True
+        try:
+            recovery = self.reader.prepare_session_recovery(self.document.source_snapshot)
+            prepared = stage_annotated_pdf(self.document.path, annotations,
+                                           validate_inherited=True,
+                                           source_snapshot=recovery.source_snapshot)
+            digest = prepared.validated_digest
+            try:
+                release_started = True
+                self.reader.release_pdf_resources()
+            except Exception:
+                prepared.discard()
+                prepared = None
+                raise
+            ambiguous = True
+            result = publish_prepared_pdf(prepared)
+            prepared = None
+            published = result.published
+            ambiguous = "ambiguous" in (result.error or "").lower()
+            if not result.success:
+                raise RuntimeError(result.error or "PDF publication failed")
+            if not result.published or result.output_path != recovery.annotation_session.path:
+                published = True
+                raise RuntimeError("Publication was reported without a verified output path")
+            error = self.document.open(recovery.annotation_session.path)
+            if error:
+                raise RuntimeError(f"The PDF was saved but could not be reopened: {error}")
+            if self.document.source_snapshot is None or self.document.source_snapshot.digest != digest:
+                raise RuntimeError("The PDF was saved but the reopened file does not match the validated output")
+            self.document.set_zoom(recovery.mode, recovery.zoom)
+            self.document.set_page(recovery.page)
+            self.reader.page_view.restore_position(*recovery.anchor)
+            recovery.restored = True
+            self.reader.pending_session_recovery = None
+            self.statusBar().showMessage(f"PDF saved to {self.document.path}.", 6000)
+        except Exception as error:
+            if prepared is not None:
+                if ambiguous and recovery is not None:
+                    recovery.prepared_output = prepared
+                else:
+                    try:
+                        prepared.discard()
+                    except Exception as cleanup_error:
+                        error = RuntimeError(f"{error}; cleanup failed: {cleanup_error}")
+            if recovery is not None and not published and not ambiguous:
+                if self.document.pdf is not None and self.document.generation == recovery.annotation_session.generation:
+                    # Staging failed before document teardown: the session is intact.
+                    if not release_started:
+                        self.reader.pending_session_recovery = None
+                elif self.reader.pending_session_recovery is recovery and self.document.pdf is None:
+                    self.reader.restore_released_session(recovery)
+                    if not recovery.restored:
+                        error = RuntimeError(f"{error}; session recovery failed: {recovery.error}")
+            if recovery is not None and self.reader.pending_session_recovery is recovery:
+                recovery.error = str(error)
+            state = "The PDF may have been published. " if published or ambiguous else "The PDF was not confirmed saved. "
+            QMessageBox.warning(self, "Unable to Complete Save", f"{state}{error}")
+        finally:
+            self._restoring = False
 
     def save_as_pdf(self) -> None:
         """Write an annotated copy while leaving the active source document untouched."""
@@ -395,6 +478,7 @@ class MainWindow(QMainWindow):
     def _document_changed(self):
         active = self.document.pdf is not None
         self.close_action.setEnabled(active)
+        self.save_action.setEnabled(active)
         self.save_as_action.setEnabled(active)
         self.sidebar_visibility_action.setEnabled(active)
         self.thumbnails_action.setEnabled(active)

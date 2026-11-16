@@ -10,6 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QCoreApplication, QEvent, QSettings, Qt
 from PySide6.QtGui import QPainter, QPdfWriter, QKeySequence
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QFileDialog, QDialog, QMessageBox
 from pypdf import PdfReader
 
@@ -100,6 +101,141 @@ class SaveAsTests(unittest.TestCase):
     def open_source(self):
         self.assertTrue(self.window.open_document(self.source))
         self.app.processEvents()
+
+    def test_save_action_and_successful_in_place_save_are_repeatable(self):
+        action = self.window.save_action
+        self.assertFalse(action.isEnabled())
+        self.assertEqual(action.shortcut(), QKeySequence(QKeySequence.StandardKey.Save))
+        self.open_source()
+        self.assertTrue(action.isEnabled())
+        self.window.document.set_zoom("Manual", 1.5)
+        self.window.reader.page_view.restore_position(1, 0.35)
+        self.app.processEvents()
+        position = self.window.reader.page_view.reading_position()
+        note = self.window.reader.annotations.add_note(0, (80, 100), "saved note")
+        self.window.activateWindow()
+        self.app.processEvents()
+        with patch("glyph_desktop.window.QMessageBox.warning") as warning:
+            QTest.keyClick(self.window, Qt.Key.Key_S, Qt.KeyboardModifier.ControlModifier)
+        warning.assert_not_called()
+        self.assertEqual(self.window.reader.annotations.items, ())
+        self.assertFalse(self.window.reader.annotations.can_undo)
+        self.assertEqual((self.window.document.mode, self.window.document.zoom), ("Manual", 1.5))
+        restored = self.window.reader.page_view.reading_position()
+        self.assertEqual(restored[0], position[0])
+        self.assertAlmostEqual(restored[1], position[1], delta=0.01)
+        saved = PdfReader(self.source)
+        ids = [str(ref.get_object().get("/NM", "")) for ref in saved.pages[0].get("/Annots", [])]
+        self.assertEqual(ids.count(note.id), 1)
+        data = self.source.read_bytes()
+        action.trigger()
+        self.assertEqual(self.source.read_bytes(), data)
+        second = self.window.reader.annotations.add_note(0, (120, 100), "second note")
+        with patch("glyph_desktop.window.QMessageBox.warning") as warning:
+            action.trigger()
+        warning.assert_not_called()
+        ids = [str(ref.get_object().get("/NM", ""))
+               for ref in PdfReader(self.source).pages[0].get("/Annots", [])]
+        self.assertEqual(ids.count(note.id), 1)
+        self.assertEqual(ids.count(second.id), 1)
+
+    def test_save_failure_restores_session_and_history(self):
+        self.open_source()
+        note = self.window.reader.annotations.add_note(0, (80, 100), "before")
+        self.window.reader.annotations.update_note_text(note.id, "after")
+        self.window.reader.annotations.undo()
+        before = self.source.read_bytes()
+        def fail(prepared):
+            prepared.discard()
+            return WriteResult(False, None, "injected failure", False, False, None)
+        with (patch("glyph_desktop.window.publish_prepared_pdf", side_effect=fail),
+              patch("glyph_desktop.window.QMessageBox.warning") as warning):
+            self.window.save_pdf()
+        warning.assert_called_once()
+        self.assertEqual(self.source.read_bytes(), before)
+        self.assertIsNone(self.window.reader.pending_session_recovery)
+        self.assertEqual(self.window.reader.annotations.get(note.id).text, "before")
+        self.assertTrue(self.window.reader.annotations.redo())
+        self.assertEqual(self.window.reader.annotations.get(note.id).text, "after")
+
+    def test_save_rejects_modified_source_without_losing_session(self):
+        self.open_source()
+        note = self.window.reader.annotations.add_note(0, (80, 100), "unsaved")
+        with self.source.open("ab") as stream:
+            stream.write(b"% external change\n")
+        data = self.source.read_bytes()
+        with patch("glyph_desktop.window.QMessageBox.warning") as warning:
+            self.window.save_pdf()
+        warning.assert_called_once()
+        self.assertEqual(self.source.read_bytes(), data)
+        self.assertEqual(self.window.reader.annotations.get(note.id), note)
+
+    def test_saved_pdf_reopen_failure_keeps_recovery(self):
+        self.open_source()
+        note = self.window.reader.annotations.add_note(0, (80, 100), "saved")
+        with (patch.object(self.window.document, "open", return_value="injected reopen failure"),
+              patch("glyph_desktop.window.QMessageBox.warning") as warning):
+            self.window.save_pdf()
+        warning.assert_called_once()
+        self.assertIn("saved", warning.call_args.args[2].lower())
+        recovery = self.window.reader.pending_session_recovery
+        self.assertIsNotNone(recovery)
+        self.assertEqual(recovery.annotation_session.items[0].id, note.id)
+        self.assertIsNone(self.window.document.pdf)
+
+    def test_ambiguous_publication_retains_recovery_without_reopening(self):
+        self.open_source()
+        note = self.window.reader.annotations.add_note(0, (80, 100), "unsaved")
+        def fail(prepared):
+            prepared.discard()
+            return WriteResult(False, None, "publication state ambiguous", False, False, None)
+        with (patch("glyph_desktop.window.publish_prepared_pdf", side_effect=fail),
+              patch("glyph_desktop.window.QMessageBox.warning") as warning):
+            self.window.save_pdf()
+        warning.assert_called_once()
+        self.assertIn("may have been published", warning.call_args.args[2])
+        self.assertIsNone(self.window.document.pdf)
+        self.assertEqual(self.window.reader.pending_session_recovery.annotation_session.items[0].id, note.id)
+
+    def test_unexpected_publication_exception_preserves_prepared_output(self):
+        self.open_source()
+        self.window.reader.annotations.add_note(0, (80, 100), "unsaved")
+        with (patch("glyph_desktop.window.publish_prepared_pdf", side_effect=RuntimeError("unexpected")),
+              patch("glyph_desktop.window.QMessageBox.warning")):
+            self.window.save_pdf()
+        recovery = self.window.reader.pending_session_recovery
+        self.assertIsNotNone(recovery.prepared_output)
+        self.assertTrue(recovery.prepared_output.path.exists())
+        recovery.prepared_output.discard()
+
+    def test_release_failure_preserves_recoverable_session(self):
+        self.open_source()
+        note = self.window.reader.annotations.add_note(0, (80, 100), "unsaved")
+        with (patch.object(self.window.reader, "release_pdf_resources", side_effect=RuntimeError("release failed")),
+              patch("glyph_desktop.window.QMessageBox.warning") as warning):
+            self.window.save_pdf()
+        warning.assert_called_once()
+        self.assertIn("release failed", warning.call_args.args[2])
+        self.assertIsNotNone(self.window.document.pdf)
+        self.assertEqual(self.window.reader.annotations.get(note.id), note)
+        self.assertEqual(self.window.reader.pending_session_recovery.annotation_session.items[0], note)
+
+    def test_changed_source_after_release_retains_recovery_and_reports_failure(self):
+        self.open_source()
+        note = self.window.reader.annotations.add_note(0, (80, 100), "unsaved")
+        release = self.window.reader.release_pdf_resources
+        def change_after_release():
+            release()
+            with self.source.open("ab") as stream:
+                stream.write(b"% external edit\n")
+        with (patch.object(self.window.reader, "release_pdf_resources", side_effect=change_after_release),
+              patch("glyph_desktop.window.QMessageBox.warning") as warning):
+            self.window.save_pdf()
+        warning.assert_called_once()
+        self.assertIn("session recovery failed", warning.call_args.args[2])
+        self.assertIsNone(self.window.document.pdf)
+        self.assertEqual(self.window.reader.pending_session_recovery.annotation_session.items[0].id, note.id)
+        self.assertTrue(self.source.read_bytes().endswith(b"% external edit\n"))
 
     def file_dialog(self, path, *, accepted=True):
         dialog = FakeSaveDialog(path, accepted)
