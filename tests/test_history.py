@@ -1,7 +1,9 @@
 import os
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -84,6 +86,160 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(restored.kind, original.kind)
         self.assertEqual(restored.page, original.page)
         self.assertEqual(restored.generation, original.generation)
+
+    def test_explicit_session_recovery_rebinds_annotations_and_history(self):
+        markup = self.make("highlight")
+        ink = self.markup.add_ink(0, ((10, 10), (30, 30)))
+        note = self.markup.add_note(0, (40, 40), "before")
+        self.markup.update_note_text(note.id, "after")
+        self.assertTrue(self.markup.undo())
+        self.markup.select(ink.id, self.document.generation)
+        snapshot = self.markup.capture_session()
+        old_generation = self.document.generation
+        self.document.close()
+        self.assertEqual(self.markup.items, ())
+        self.assertFalse(self.markup.can_undo)
+        self.assertIsNone(self.document.open(self.path))
+        self.assertGreater(self.document.generation, old_generation)
+        notifications = []
+        self.markup.changed.connect(lambda: notifications.append(True))
+        self.markup.restore_session(snapshot)
+        self.assertEqual(len(notifications), 1)
+        self.assertEqual([item.id for item in self.markup.items], [markup.id, ink.id, note.id])
+        self.assertEqual(self.markup.selected_id, ink.id)
+        self.assertTrue(all(item.generation == self.document.generation for item in self.markup.items))
+        self.assertTrue(self.reader.undo_action.isEnabled())
+        self.assertTrue(self.reader.redo_action.isEnabled())
+        self.assertTrue(self.markup.redo())
+        self.assertEqual(self.markup.get(note.id).text, "after")
+        self.assertTrue(self.markup.undo())
+        self.assertEqual(self.markup.get(note.id).text, "before")
+        self.assertTrue(self.markup.undo())
+        self.assertIsNone(self.markup.get(note.id))
+        self.assertTrue(self.markup.redo())
+        self.assertEqual(self.markup.get(note.id).text, "before")
+
+    def test_session_recovery_rejects_wrong_document_and_invalid_data_atomically(self):
+        item = self.markup.add_note(0, (20, 20), "note")
+        snapshot = self.markup.capture_session()
+        with self.assertRaises(ValueError):
+            self.markup.restore_session(snapshot)
+        other = Path(self.temp.name) / "other.pdf"
+        write_link_pdf(other)
+        self.assertIsNone(self.document.open(other))
+        with self.assertRaises(ValueError):
+            self.markup.restore_session(snapshot)
+        self.assertEqual(self.markup.items, ())
+        self.assertIsNone(self.document.open(self.path))
+        invalid = replace(snapshot, items=(replace(item, page=self.document.count),))
+        with self.assertRaises(ValueError):
+            self.markup.restore_session(invalid)
+        bad_history = replace(snapshot, undo=(replace(snapshot.undo[0], generation=-1),))
+        with self.assertRaises(ValueError):
+            self.markup.restore_session(bad_history)
+        self.assertEqual(self.markup.items, ())
+        self.assertFalse(self.markup.can_undo)
+        self.markup.restore_session(snapshot)
+        self.assertEqual(self.markup.items[0].id, item.id)
+
+    def test_session_snapshot_does_not_restore_automatically(self):
+        self.markup.add_note(0, (20, 20), "note")
+        self.markup.capture_session()
+        self.document.close()
+        self.assertIsNone(self.document.open(self.path))
+        self.assertEqual(self.markup.items, ())
+        self.assertFalse(self.markup.can_undo)
+
+    def test_session_recovery_rejects_replaced_file_at_same_path(self):
+        self.markup.add_note(0, (20, 20), "note")
+        snapshot = self.markup.capture_session()
+        replacement = Path(self.temp.name) / "replacement.pdf"
+        write_link_pdf(replacement)
+        self.document.close()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        replacement.replace(self.path)
+        self.assertIsNone(self.document.open(self.path))
+        with self.assertRaisesRegex(ValueError, "different document"):
+            self.markup.restore_session(snapshot)
+        self.assertEqual(self.markup.items, ())
+
+    def test_release_reopen_session_restores_annotations_history_and_view(self):
+        self.make("highlight")
+        note = self.markup.add_note(1, (30, 30), "before")
+        self.markup.update_note_text(note.id, "after")
+        self.assertTrue(self.markup.undo())
+        self.markup.select(note.id, self.document.generation)
+        self.document.set_zoom("Manual", 1.5)
+        self.reader.page_view.restore_position(1, 0.45)
+        self.app.processEvents()
+        anchor = self.reader.page_view.reading_position()
+        page = self.document.page
+        items = self.markup.items
+        recovery = self.reader.release_and_reopen_session()
+        self.assertTrue(recovery.restored, recovery.error)
+        self.assertIsNone(self.reader.pending_session_recovery)
+        self.assertEqual([item.id for item in self.markup.items], [item.id for item in items])
+        self.assertEqual(self.markup.selected_id, note.id)
+        self.assertEqual((self.document.mode, self.document.zoom), ("Manual", 1.5))
+        self.assertEqual(self.document.page, page)
+        restored_anchor = self.reader.page_view.reading_position()
+        self.assertEqual(restored_anchor[0], anchor[0])
+        self.assertAlmostEqual(restored_anchor[1], anchor[1], delta=0.01)
+        self.assertTrue(self.markup.redo())
+        self.assertEqual(self.markup.get(note.id).text, "after")
+        self.assertTrue(self.markup.undo())
+        self.assertEqual(self.markup.get(note.id).text, "before")
+
+    def test_release_reopen_failure_retains_session_for_retry(self):
+        note = self.markup.add_note(0, (20, 20), "recover me")
+        with patch.object(self.document, "open", return_value="injected open failure"):
+            recovery = self.reader.release_and_reopen_session()
+        self.assertFalse(recovery.restored)
+        self.assertIn("injected open failure", recovery.error)
+        self.assertIs(self.reader.pending_session_recovery, recovery)
+        self.assertEqual(recovery.annotation_session.items[0].id, note.id)
+        self.assertIsNone(self.document.pdf)
+        self.reader.restore_released_session(recovery)
+        self.assertTrue(recovery.restored, recovery.error)
+        self.assertEqual(self.markup.items[0].id, note.id)
+
+    def test_release_reopen_rejects_source_changed_after_release(self):
+        note = self.markup.add_note(0, (20, 20), "unsaved")
+        release = self.reader.release_pdf_resources
+        def changed():
+            release()
+            with self.path.open("ab") as stream:
+                stream.write(b"% external change\n")
+        with patch.object(self.reader, "release_pdf_resources", side_effect=changed):
+            recovery = self.reader.release_and_reopen_session()
+        self.assertFalse(recovery.restored)
+        self.assertIn("changed", recovery.error.lower())
+        self.assertIs(self.reader.pending_session_recovery, recovery)
+        self.assertEqual(recovery.annotation_session.items[0].id, note.id)
+        self.assertIsNone(self.document.pdf)
+
+    def test_release_failure_retains_session_and_can_retry(self):
+        note = self.markup.add_note(0, (20, 20), "unsaved")
+        with patch.object(self.reader, "release_pdf_resources", side_effect=RuntimeError("release failed")):
+            recovery = self.reader.release_and_reopen_session()
+        self.assertIn("release failed", recovery.error)
+        self.assertEqual(recovery.annotation_session.items[0].id, note.id)
+        self.assertIsNotNone(self.document.pdf)
+        self.reader.restore_released_session(recovery)
+        self.assertTrue(recovery.restored, recovery.error)
+        self.assertEqual(self.markup.items[0].id, note.id)
+
+    def test_restore_failure_retains_session_and_retries_open_document(self):
+        note = self.markup.add_note(0, (20, 20), "unsaved")
+        with patch.object(self.markup, "restore_session", side_effect=ValueError("restore failed")):
+            recovery = self.reader.release_and_reopen_session()
+        self.assertIn("restore failed", recovery.error)
+        self.assertEqual(recovery.annotation_session.items[0].id, note.id)
+        self.assertIsNotNone(self.document.pdf)
+        self.assertEqual(self.markup.items, ())
+        self.reader.restore_released_session(recovery)
+        self.assertTrue(recovery.restored, recovery.error)
+        self.assertEqual(self.markup.items[0].id, note.id)
 
     def test_markup_create_undo_redo_restores_the_same_annotation(self):
         for kind in ("highlight", "underline", "strikeout"):

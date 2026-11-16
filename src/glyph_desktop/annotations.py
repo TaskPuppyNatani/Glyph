@@ -3,13 +3,14 @@ in PDF page coordinates, with a bounded undo/redo history over their mutations."
 
 import math
 from dataclasses import dataclass, replace
+from pathlib import Path
 from uuid import uuid4
 
 from PySide6.QtCore import QObject, Signal, Qt
 from PySide6.QtGui import QPolygonF
 from PySide6.QtCore import QPointF
 
-from .history import AnnotationHistory, CREATE, DELETE, UPDATE
+from .history import AnnotationHistory, AnnotationOperation, CREATE, DELETE, UPDATE
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,18 @@ class Note:
     generation: int
     anchor: tuple[float, float]
     text: str
+
+
+@dataclass(frozen=True)
+class AnnotationSessionSnapshot:
+    """Value-only recovery state for one open document."""
+    path: Path
+    identity: tuple[int, int]
+    generation: int
+    items: tuple
+    selected_id: str | None
+    undo: tuple
+    redo: tuple
 
 
 INK_WIDTH = 2.5
@@ -90,6 +103,71 @@ class Annotations(QObject):
         self._items.clear()
         self.selected_id = None
         self.history.clear()
+        self.changed.emit()
+
+    def capture_session(self) -> AnnotationSessionSnapshot:
+        """Capture annotations and history for explicit recovery after reopen."""
+        if self.document.pdf is None or self.document.path is None:
+            raise ValueError("An open document is required")
+        path = Path(self.document.path).resolve(strict=True)
+        info = path.stat()
+        if not info.st_ino:
+            raise ValueError("Document identity cannot be verified")
+        return AnnotationSessionSnapshot(path, (info.st_dev, info.st_ino),
+                                         self.document.generation, self.items,
+                                         self.selected_id, tuple(self.history._undo),
+                                         tuple(self.history._redo))
+
+    def restore_session(self, snapshot: AnnotationSessionSnapshot) -> None:
+        """Restore a captured session to the same reopened document atomically."""
+        if not isinstance(snapshot, AnnotationSessionSnapshot):
+            raise ValueError("Invalid annotation session snapshot")
+        if self.document.pdf is None or self.document.path is None:
+            raise ValueError("An open document is required")
+        if (type(snapshot.generation) is not int or snapshot.generation < 0
+                or self.document.generation <= snapshot.generation):
+            raise ValueError("Document has not been reopened after the snapshot")
+        path = Path(self.document.path).resolve(strict=True)
+        info = path.stat()
+        if path != snapshot.path or not info.st_ino or (info.st_dev, info.st_ino) != snapshot.identity:
+            raise ValueError("Snapshot belongs to a different document")
+        if self._items or self.history._undo or self.history._redo or self.selected_id is not None:
+            raise ValueError("Cannot replace a nonempty annotation session")
+        generation = self.document.generation
+
+        def rebind(item):
+            if (type(item) not in (Markup, Ink, Note) or item.generation != snapshot.generation
+                    or type(item.page) is not int or not 0 <= item.page < self.document.count):
+                raise ValueError("Snapshot contains an incompatible annotation")
+            return replace(item, generation=generation)
+
+        def rebind_operation(operation):
+            if (type(operation) is not AnnotationOperation or operation.generation != snapshot.generation
+                    or operation.action not in (CREATE, DELETE, UPDATE)
+                    or type(operation.index) is not int or operation.index < 0):
+                raise ValueError("Snapshot contains incompatible history")
+            item = rebind(operation.annotation)
+            previous = rebind(operation.previous) if operation.previous is not None else None
+            if ((operation.action == UPDATE) != (previous is not None)
+                    or (previous is not None and (previous.id != item.id or previous.page != item.page
+                                                  or type(previous) is not type(item)))):
+                raise ValueError("Snapshot contains incompatible history")
+            return replace(operation, generation=generation, annotation=item, previous=previous)
+
+        if not all(type(value) is tuple for value in (snapshot.items, snapshot.undo, snapshot.redo)):
+            raise ValueError("Snapshot contains mutable session data")
+        items = [rebind(item) for item in snapshot.items]
+        ids = [item.id for item in items]
+        if len(set(ids)) != len(ids) or (snapshot.selected_id is not None and snapshot.selected_id not in ids):
+            raise ValueError("Snapshot contains invalid selection or duplicate annotations")
+        undo = [rebind_operation(operation) for operation in snapshot.undo]
+        redo = [rebind_operation(operation) for operation in snapshot.redo]
+        if len(undo) > self.history.limit or len(redo) > self.history.limit:
+            raise ValueError("Snapshot history exceeds the configured limit")
+        self._items[:] = items
+        self.selected_id = snapshot.selected_id
+        self.history._undo[:] = undo
+        self.history._redo[:] = redo
         self.changed.emit()
 
     def get(self, item_id):

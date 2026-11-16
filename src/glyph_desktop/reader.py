@@ -4,8 +4,9 @@ import math
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from pathlib import Path
+import shiboken6
 
-from PySide6.QtCore import (QAbstractListModel, QEvent, QModelIndex, QObject, QPointF, QRectF,
+from PySide6.QtCore import (QAbstractListModel, QCoreApplication, QEvent, QModelIndex, QObject, QPointF, QRectF, QThread,
                             QSize, Qt, QTimer, Signal)
 from PySide6.QtGui import (QAction, QColor, QImage, QIntValidator, QKeySequence, QPainter, QPen, QPixmap, QTransform, QPolygonF,
                            QPalette)
@@ -23,6 +24,21 @@ from .outline import OutlineDestination, OutlinePanel
 from .links import PdfLinks
 from .annotations import Annotations, NOTE_MARKER_SIZE
 from .note_editor import NoteEditor
+from .pdf_writer import capture_source_snapshot, verify_source_snapshot
+
+
+@dataclass
+class DocumentSessionRecovery:
+    """Retained values for explicit recovery after releasing a PDF."""
+    annotation_session: object
+    page: int
+    anchor: tuple
+    mode: str
+    zoom: float
+    source_snapshot: object = None
+    restored: bool = False
+    error: str | None = None
+    prepared_output: object = None
 
 
 class Document(QObject):
@@ -35,6 +51,7 @@ class Document(QObject):
         super().__init__(parent)
         self.pdf: QPdfDocument | None = None
         self.path: Path | None = None
+        self.source_snapshot = None
         self.page_sizes: list[tuple[float, float]] = []
         self.page = 0
         self.mode = "Fit Page"
@@ -46,6 +63,10 @@ class Document(QObject):
         return self.pdf.pageCount() if self.pdf else 0
 
     def open(self, path: str | Path) -> str | None:
+        try:
+            source_snapshot = capture_source_snapshot(path)
+        except (OSError, ValueError) as error:
+            return f"This PDF could not be safely opened: {error}"
         candidate = QPdfDocument(self)
         error = candidate.load(str(path))
         if (error != QPdfDocument.Error.None_ or candidate.status() != QPdfDocument.Status.Ready
@@ -56,11 +77,19 @@ class Document(QObject):
                 return "Password-protected PDFs are not supported yet."
             return "This PDF could not be opened. Check that the file is readable and valid."
 
+        try:
+            verify_source_snapshot(source_snapshot)
+        except (OSError, ValueError):
+            candidate.close()
+            candidate.deleteLater()
+            return "The PDF changed while it was being opened."
+
         self.aboutToChange.emit()
         self._release_document()
         self.generation += 1
         self.pdf = candidate
         self.path = Path(path)
+        self.source_snapshot = source_snapshot
         self.page_sizes = []
         for page in range(candidate.pageCount()):
             size = candidate.pagePointSize(page)
@@ -76,6 +105,7 @@ class Document(QObject):
             self.pdf.deleteLater()
         self.pdf = None
         self.path = None
+        self.source_snapshot = None
         self.page_sizes = []
         self.page = 0
 
@@ -979,6 +1009,8 @@ class Reader(QWidget):
         self.full_cache = BoundedImageCache(8, 96 * 1024 * 1024)
         self.thumbnail_cache = BoundedImageCache(32, 8 * 1024 * 1024)
         self.controller: PageRenderController | None = None
+        self._pdf_release_pending = None
+        self.pending_session_recovery: DocumentSessionRecovery | None = None
         self._full_jobs: dict[int, RenderJob] = {}
         self._zoom_revision = 0
         self._view_generation = -1
@@ -1167,6 +1199,126 @@ class Reader(QWidget):
         self.page_view.clear_document()
         self._view_generation = -1
         self._zoom_revision += 1
+
+    def release_pdf_resources(self) -> None:
+        """Synchronously release the active PDF and its dependent Qt objects.
+
+        The caller must capture any annotations it needs before invoking this.
+        Only deferred deletion events for the retired objects are delivered.
+        """
+        if QThread.currentThread() != self.thread():
+            raise RuntimeError("PDF resources must be released on the reader's thread")
+        pdf = self.document.pdf
+        if pdf is None:
+            if self._pdf_release_pending is not None:
+                pending_pdf, controller, renderer, link_model, outline_model = self._pdf_release_pending
+                for obj in (renderer, link_model, outline_model, controller, pending_pdf):
+                    if obj is not None and shiboken6.isValid(obj):
+                        if obj is controller:
+                            obj.deleteLater()
+                        QCoreApplication.sendPostedEvents(obj, QEvent.Type.DeferredDelete)
+                        if shiboken6.isValid(obj):
+                            raise RuntimeError("A PDF resource could not be destroyed")
+                self._pdf_release_pending = None
+            if self.controller is not None:
+                raise RuntimeError("Renderer exists without an open PDF")
+            return
+        if self._pdf_release_pending is None:
+            controller = self.controller
+            renderer = controller.renderer if controller else None
+            link_model = self.links.model
+            outline_model = self.outline_panel.model
+            if outline_model is self.outline_panel._empty_model:
+                outline_model = None
+            self._pdf_release_pending = (pdf, controller, renderer, link_model, outline_model)
+            self._reset_document_state()
+        else:
+            old_pdf, controller, renderer, link_model, outline_model = self._pdf_release_pending
+            if old_pdf is not pdf:
+                raise RuntimeError("A previous PDF release remains incomplete")
+        for obj in (renderer, link_model, outline_model):
+            if obj is not None and shiboken6.isValid(obj):
+                QCoreApplication.sendPostedEvents(obj, QEvent.Type.DeferredDelete)
+                if shiboken6.isValid(obj):
+                    raise RuntimeError("A dependent PDF object could not be destroyed")
+        if controller is not None and shiboken6.isValid(controller):
+            controller.deleteLater()
+            QCoreApplication.sendPostedEvents(controller, QEvent.Type.DeferredDelete)
+            if shiboken6.isValid(controller):
+                raise RuntimeError("PDF render controller could not be destroyed")
+        self.document.close()
+        if shiboken6.isValid(pdf):
+            QCoreApplication.sendPostedEvents(pdf, QEvent.Type.DeferredDelete)
+        if shiboken6.isValid(pdf):
+            raise RuntimeError("PDF document could not be destroyed")
+        self._pdf_release_pending = None
+
+    def release_and_reopen_session(self) -> DocumentSessionRecovery:
+        """Release, reopen and restore an unchanged PDF, retaining failed state."""
+        if self.pending_session_recovery is not None:
+            raise RuntimeError("A previous session is awaiting recovery")
+        session = self.annotations.capture_session()
+        recovery = DocumentSessionRecovery(session, self.document.page,
+                                           self.page_view.reading_position(),
+                                           self.document.mode, self.document.zoom)
+        self.pending_session_recovery = recovery
+        try:
+            recovery.source_snapshot = capture_source_snapshot(session.path)
+            if recovery.source_snapshot.state[:2] != session.identity:
+                raise ValueError("Source identity changed during capture")
+        except Exception as error:
+            recovery.error = f"{type(error).__name__}: {error}"
+            return recovery
+        return self.restore_released_session(recovery)
+
+    def prepare_session_recovery(self, source_snapshot) -> DocumentSessionRecovery:
+        """Capture recoverable state against the document's opening snapshot."""
+        if self.pending_session_recovery is not None:
+            raise RuntimeError("A previous session is awaiting recovery")
+        session = self.annotations.capture_session()
+        if (source_snapshot is None or source_snapshot.path != session.path
+                or source_snapshot.state[:2] != session.identity):
+            raise ValueError("The open document does not match its source snapshot")
+        recovery = DocumentSessionRecovery(session, self.document.page,
+                                           self.page_view.reading_position(),
+                                           self.document.mode, self.document.zoom,
+                                           source_snapshot)
+        self.pending_session_recovery = recovery
+        return recovery
+
+    def restore_released_session(self, recovery: DocumentSessionRecovery) -> DocumentSessionRecovery:
+        """Retry an explicit recovery; never restore over another document."""
+        if recovery is not self.pending_session_recovery or recovery.restored:
+            raise ValueError("Session recovery is not pending")
+        try:
+            if recovery.source_snapshot is None:
+                raise ValueError("Source content evidence was not captured")
+            if recovery.source_snapshot.state[:2] != recovery.annotation_session.identity:
+                raise ValueError("Source identity changed during capture")
+            verify_source_snapshot(recovery.source_snapshot)
+            if self.document.pdf is not None:
+                if self.document.path != recovery.annotation_session.path:
+                    raise ValueError("A different document is open")
+                if self.document.generation == recovery.annotation_session.generation:
+                    self.release_pdf_resources()
+            else:
+                self.release_pdf_resources()
+            if self.document.pdf is None:
+                verify_source_snapshot(recovery.source_snapshot)
+                error = self.document.open(recovery.annotation_session.path)
+                if error:
+                    raise RuntimeError(error)
+            verify_source_snapshot(recovery.source_snapshot)
+            self.document.set_zoom(recovery.mode, recovery.zoom)
+            self.document.set_page(recovery.page)
+            self.page_view.restore_position(*recovery.anchor)
+            self.annotations.restore_session(recovery.annotation_session)
+            recovery.restored = True
+            recovery.error = None
+            self.pending_session_recovery = None
+        except Exception as error:
+            recovery.error = f"{type(error).__name__}: {error}"
+        return recovery
 
     def undo_annotation(self) -> bool:
         """Undo the newest annotation mutation, or discard an unfinished stroke."""

@@ -2,6 +2,7 @@ import hashlib
 import os
 import tempfile
 import unittest
+import shiboken6
 from pathlib import Path
 from unittest.mock import patch
 
@@ -77,6 +78,51 @@ class ReaderTests(unittest.TestCase):
         self.reader.show()
         self.assertIsNone(self.doc.open(path or self.many))
         self.app.processEvents()
+
+    def test_synchronous_release_destroys_pdf_and_renderer_and_rejects_stale_result(self):
+        self.reader.release_pdf_resources()
+        self.open_reader()
+        pdf = self.doc.pdf
+        controller = self.reader.controller
+        renderer = controller.renderer
+        old_generation = self.doc.generation
+        job = make_render_job(0, QSize(180, 240), 1.0, "page", self.reader._zoom_revision)
+        controller.set_jobs([job])
+        self.reader.release_pdf_resources()
+        self.assertFalse(shiboken6.isValid(renderer))
+        self.assertFalse(shiboken6.isValid(controller))
+        self.assertFalse(shiboken6.isValid(pdf))
+        self.assertIsNone(self.doc.pdf)
+        self.assertIsNone(self.reader.controller)
+        self.reader.release_pdf_resources()
+        self.open_reader(self.one)
+        image = QImage(180, 240, QImage.Format.Format_ARGB32)
+        image.fill(Qt.GlobalColor.red)
+        self.reader._on_rendered(job, image, old_generation)
+        self.assertIsNone(self.reader.full_cache.get(self.reader._cache_key(job, self.doc.generation)))
+        self.reader._request_visible_pages()
+        loop = QEventLoop()
+        timer = QTimer()
+        timer.setInterval(10)
+        timer.timeout.connect(lambda: loop.quit() if self.reader.page_image(0) is not None else None)
+        timer.start()
+        QTimer.singleShot(5000, loop.quit)
+        if self.reader.page_image(0) is None:
+            loop.exec()
+        timer.stop()
+        self.assertIsNotNone(self.reader.page_image(0))
+
+    def test_release_failure_is_reported_and_can_be_retried(self):
+        self.open_reader()
+        pdf = self.doc.pdf
+        renderer = self.reader.controller.renderer
+        with patch.object(QCoreApplication, "sendPostedEvents"):
+            with self.assertRaisesRegex(RuntimeError, "could not be destroyed"):
+                self.reader.release_pdf_resources()
+        self.assertTrue(shiboken6.isValid(renderer))
+        self.reader.release_pdf_resources()
+        self.assertFalse(shiboken6.isValid(renderer))
+        self.assertFalse(shiboken6.isValid(pdf))
 
     def test_continuous_layout_orders_centers_and_preserves_page_ratio(self):
         self.open_reader()

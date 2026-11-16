@@ -1,18 +1,28 @@
-# PDF annotation persistence and Save As
+# PDF annotation persistence
 
-M3E1B introduced the internal pypdf writer boundary; that foundation did not add
-a GUI save command or import annotations from PDFs. M3E2 adds File → Save As,
-which writes the current generation's Glyph annotations to a separate PDF copy.
-The original source remains active and unchanged. Save As asks for explicit
-confirmation before replacing an existing destination; cancel leaves it
-untouched. Replacement is an opt-in writer argument, and callers that do not
-provide a prepared confirmation target retain the no-overwrite default. Glyph
-displays supported native PDF annotations when reopening a copy, including
-annotations previously written by Save As. It does not import them as editable
-Glyph records. The writer accepts a source path, destination path, and immutable
-snapshot of Glyph annotations. It refuses encrypted PDFs and known signature
-markers, writes into a private staging directory beside the destination,
-validates the retained output file with pypdf and QtPdf, then publishes it.
+M3E1B introduced the internal pypdf writer boundary. File → Save As writes the
+current Glyph session annotations to a separate PDF copy, leaving the source
+open and unchanged. Replacing an existing Save As destination requires explicit
+confirmation; cancel leaves it untouched. Replacement is an opt-in writer
+argument, and callers that do not provide a prepared confirmation target retain
+the no-overwrite default.
+
+File → Save (Ctrl+S) writes the current Glyph session annotations into the open
+PDF. It uses the source identity and content snapshot captured when the document
+was opened, validates inherited annotations and the complete staged output,
+then publishes those exact staged bytes through the platform-specific in-place
+replacement path. The reader and renderer release their PDF handles before
+publication; after success Glyph reopens the PDF and restores the reading
+position and zoom. Saved annotations become native PDF annotations, so Glyph
+clears their session overlays and associated undo/redo history. Save with no
+session annotations is a no-op. A source that changed since opening is rejected.
+
+Save As continues to ask for explicit confirmation before replacing an
+existing destination. Glyph displays supported native PDF annotations when
+reopening a saved PDF, including annotations previously written by Glyph, but
+does not import them as editable Glyph records. The writer refuses encrypted
+PDFs and known signature markers, writes into a private staging directory, and
+validates the retained output file with pypdf and QtPdf before publication.
 
 ## Coordinates and markup appearance
 
@@ -116,8 +126,7 @@ no-replace rename semantics ([`SetFileInformationByHandle`](https://learn.micros
 The writer reports successful publication but sets `crash_durable=False` and
 returns a warning because this implementation does not have a supported
 parent-directory flush guarantee. A Linux-style directory `fsync` is not used
-on Windows. The M3E1B writer was validated by its native Windows persistence
-suite; native Windows verification of the M3E2 Save As GUI remains outstanding.
+on Windows.
 
 `WriteResult` distinguishes a published file from a guaranteed crash-durable
 directory entry. Cleanup failures are returned through the same result API;
@@ -130,6 +139,14 @@ attributes and compares its volume and 128-bit file ID to the retained validated
 handle. If that check fails, it reports `success=False`, `published=True`,
 `output_path=None`, and an unknown actual location; it does not delete the
 published file. This check does not eliminate the directory-redirection race.
+
+In-place Save uses the prepared-output publication API. It pins the original
+file against new writes and deletes, checks the previously captured source
+snapshot and staged content digest, and renames the retained staged handle. It
+still resolves the absolute destination at rename, so callers must use a
+trusted local directory and trusted ancestors. It does not provide adversarial
+directory safety or Windows parent-directory crash durability; the GUI releases
+its Qt document and renderer before publication.
 
 ## Rendering and preservation limits
 
@@ -157,5 +174,4 @@ support arbitrary tilted text quads, or promise preservation for every PDF
 feature. Successfully reopening a result with pypdf and QtPdf does not prove
 that all document features were preserved. AES handling, arbitrary document
 preservation, other PDF viewers, and annotation import remain outside this
-foundation. M3E1B did not include a Save As workflow; M3E2 adds the GUI copy
-workflow described above. Ordinary Save remains out of scope.
+foundation.

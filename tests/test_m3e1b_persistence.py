@@ -6,6 +6,7 @@ import stat
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -173,6 +174,28 @@ class PersistenceFoundationTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def test_exported_note_dates_use_timezone_aware_export_time(self):
+        source = _core_fixture(self.root / "dated-source.pdf")
+        destination = self.root / "dated-output.pdf"
+        reader = PdfReader(source, strict=True)
+        geometry = PageGeometry.from_page(reader.pages[0], _qt_page_sizes(source)[0])
+        note = _items(geometry)[0]
+        now = datetime(2026, 11, 16, 18, 45, 32, tzinfo=timezone.utc)
+        with patch("glyph_desktop.pdf_annotations.datetime") as clock:
+            clock.now.return_value = now
+            converted = convert_annotation(note, geometry)
+            result = write_annotated_pdf(source, destination, (note,))
+        self.assertTrue(result.success, result.error)
+        clock.now.assert_called_with(timezone.utc)
+        annotations = [ref.get_object() for ref in PdfReader(destination, strict=True).pages[0]["/Annots"]]
+        saved = next(item for item in annotations if str(item.get("/NM", "")) == note.id)
+        for key in ("/M", "/CreationDate"):
+            value = str(saved[key])
+            self.assertEqual(value, str(converted[key]))
+            parsed = datetime.strptime(value, "D:%Y%m%d%H%M%SZ").replace(tzinfo=timezone.utc)
+            self.assertLessEqual(abs((parsed - now).total_seconds()), 1)
+        self.assertEqual(str(saved["/Contents"]), note.text)
 
     def test_geometry_matches_qtpdf_crop_rotation_and_link_coordinates(self):
         for rotation in (0, 90, 180, 270):
