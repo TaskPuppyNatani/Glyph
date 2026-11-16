@@ -6,8 +6,11 @@ annotations are not imported into that editable collection.
 """
 
 from dataclasses import dataclass
+from collections import Counter
+from decimal import Decimal
 import ctypes
 import errno
+import hashlib
 import ntpath
 import os
 from pathlib import Path
@@ -18,7 +21,9 @@ import tempfile
 from typing import Iterable
 
 from pypdf import PdfReader, PdfWriter
-from pypdf.generic import ArrayObject, DictionaryObject, FloatObject, IndirectObject, NameObject
+from pypdf.generic import (ArrayObject, BooleanObject, ByteStringObject, DictionaryObject,
+                           FloatObject, IndirectObject, NameObject, NullObject, NumberObject,
+                           StreamObject, TextStringObject)
 from PySide6.QtCore import QFile, QFileDevice, QIODevice
 from PySide6.QtPdf import QPdfDocument
 
@@ -41,6 +46,53 @@ class WriteResult:
     published: bool = False
     crash_durable: bool = False
     warning: str | None = None
+
+
+@dataclass(frozen=True)
+class SourceSnapshot:
+    """Identity, metadata and content observed for a source PDF."""
+    path: Path
+    state: tuple
+    digest: bytes
+
+
+def capture_source_snapshot(path) -> SourceSnapshot:
+    """Capture a stable observation; reject links and files changing during reading."""
+    path = Path(path).expanduser().absolute()
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    before_path = os.lstat(path)
+    if not stat.S_ISREG(before_path.st_mode) or not before_path.st_ino:
+        raise ValueError("Source identity cannot be verified as a regular file")
+    descriptor = os.open(path, flags)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or not before.st_ino:
+            raise ValueError("Source identity cannot be verified as a regular file")
+        def state(info):
+            return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+        if state(before_path) != state(before):
+            raise ValueError("Source changed while opening it")
+        digest = hashlib.sha256()
+        while True:
+            block = os.read(descriptor, 1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+        after = os.fstat(descriptor)
+        after_path = os.lstat(path)
+        if state(before) != state(after) or state(before) != state(after_path):
+            raise ValueError("Source changed while reading it")
+        return SourceSnapshot(path, state(before), digest.digest())
+    finally:
+        os.close(descriptor)
+
+
+def verify_source_snapshot(snapshot: SourceSnapshot) -> None:
+    """Fail if a fresh stable observation differs from the captured source."""
+    if not isinstance(snapshot, SourceSnapshot):
+        raise TypeError("A source snapshot is required")
+    if capture_source_snapshot(snapshot.path) != snapshot:
+        raise ValueError("Source PDF has changed since it was captured")
 
 
 @dataclass
@@ -754,6 +806,446 @@ def _cleanup_stage_directory(path: Path | None):
         path.rmdir()
 
 
+def _canonical_annotation_value(value, active=None):
+    """Compare supported object graphs by content, not indirect object numbers."""
+    if active is None:
+        active = set()
+    if isinstance(value, IndirectObject):
+        value = value.get_object()
+    if isinstance(value, (DictionaryObject, ArrayObject)):
+        identity = id(value)
+        if identity in active:
+            raise ValueError("Cyclic annotation structure cannot be verified")
+        active.add(identity)
+        try:
+            if isinstance(value, ArrayObject):
+                return ("array", tuple(_canonical_annotation_value(item, active) for item in value))
+            is_stream = isinstance(value, StreamObject)
+            ignored = {"/Length", "/Filter", "/DecodeParms"} if is_stream else set()
+            entries = tuple(sorted((str(key), _canonical_annotation_value(item, active))
+                                   for key, item in value.items() if str(key) not in ignored))
+            if is_stream:
+                return ("stream", entries, value.get_data())
+            return ("dict", entries)
+        finally:
+            active.remove(identity)
+    if isinstance(value, NameObject):
+        return ("name", str(value))
+    if isinstance(value, TextStringObject):
+        return ("text", str(value))
+    if isinstance(value, ByteStringObject):
+        return ("bytes", bytes(value))
+    if isinstance(value, BooleanObject):
+        return ("bool", bool(value.value))
+    if isinstance(value, NullObject):
+        return ("null",)
+    if isinstance(value, (FloatObject, NumberObject)):
+        number = Decimal(value.myrepr() if isinstance(value, FloatObject) else str(value))
+        if not number.is_finite():
+            raise ValueError("Non-finite annotation number cannot be verified")
+        return ("number", number)
+    raise ValueError(f"Unsupported annotation object: {type(value).__name__}")
+
+
+def _canonical_page_annotation(annotation, page):
+    if not isinstance(annotation, DictionaryObject):
+        raise ValueError("Invalid inherited annotation")
+    if "/P" in annotation:
+        page_ref = annotation.raw_get("/P")
+        if (not isinstance(page_ref, IndirectObject)
+                or page_ref != page.indirect_reference):
+            raise ValueError("Annotation page reference cannot be verified")
+    return ("annotation", "/P" in annotation, tuple(sorted(
+        (str(key), _canonical_annotation_value(value))
+        for key, value in annotation.items() if str(key) != "/P")))
+
+
+def _inherited_annotations(reader):
+    pages = []
+    supported = {"/Ink", "/Text", "/Highlight", "/Underline", "/StrikeOut"}
+    for page in reader.pages:
+        records = []
+        for reference in page.get("/Annots", []):
+            annotation = reference.get_object()
+            if not isinstance(annotation, DictionaryObject) or str(annotation.get("/Subtype")) not in supported:
+                raise ValueError("Unsupported inherited annotation cannot be verified")
+            records.append(_canonical_page_annotation(annotation, page))
+        pages.append(Counter(records))
+    return pages
+
+
+def _validate_inherited_annotations(source, stream, expected):
+    before = _inherited_annotations(source)
+    stream.seek(0)
+    output = PdfReader(stream, strict=True)
+    for page_number, page in enumerate(output.pages):
+        annotations = list(page.get("/Annots", []))
+        inherited_count = sum(before[page_number].values())
+        added_count = sum(record["page"] == page_number for record in expected.values())
+        if len(annotations) != inherited_count + added_count:
+            raise ValueError("Inherited annotations are missing or duplicated")
+        records = []
+        for reference in annotations[:inherited_count]:
+            annotation = reference.get_object()
+            records.append(_canonical_page_annotation(annotation, page))
+        if Counter(records) != before[page_number]:
+            raise ValueError("Inherited annotations are altered or relocated")
+
+
+def _build_annotated_pdf(source_resolved, annotations):
+    snapshot = tuple(annotations)
+    generations = {item.generation for item in snapshot}
+    if len(generations) > 1:
+        raise ValueError("Annotation snapshot mixes document generations")
+    reader = PdfReader(source_resolved, strict=True)
+    if reader.is_encrypted:
+        raise ValueError("Encrypted PDFs are not supported by annotation persistence")
+    if _contains_signature_marker(reader):
+        raise ValueError("Signed PDFs are not supported by annotation persistence")
+    qt_sizes = _qt_page_sizes(source_resolved)
+    if len(qt_sizes) != len(reader.pages):
+        raise ValueError("QtPdf and pypdf reported different page counts")
+    writer = PdfWriter(clone_from=reader)
+    expected = {}
+    for item in snapshot:
+        if (not isinstance(item.page, int) or isinstance(item.page, bool)
+                or not 0 <= item.page < len(reader.pages)):
+            raise ValueError("Annotation page is outside the source PDF")
+        if item.id in expected:
+            raise ValueError("Annotation snapshot contains duplicate ids")
+        geometry = PageGeometry.from_page(reader.pages[item.page], qt_sizes[item.page])
+        annotation = convert_annotation(item, geometry)
+        appearance = annotation.get("/AP")
+        if appearance is not None:
+            normal = appearance.get("/N")
+            if normal is not None and not isinstance(normal, IndirectObject):
+                appearance[NameObject("/N")] = writer._add_object(normal)
+        expected[item.id] = _annotation_record(item.page, annotation)
+        writer.add_annotation(item.page, annotation)
+    return reader, writer, expected
+
+
+def _stream_digest(stream):
+    stream.seek(0)
+    digest = hashlib.sha256()
+    while True:
+        block = stream.read(1024 * 1024)
+        if not block:
+            return digest.digest()
+        digest.update(block)
+
+
+def _write_validated_pdf(reader, writer, expected, stream, *, capture_digest=False):
+    writer.write(stream)
+    stream.flush()
+    os.fsync(stream.fileno())
+    digest = _stream_digest(stream) if capture_digest else None
+    _validate_output(reader, stream, expected)
+    return digest
+
+
+class PreparedPdfOutput:
+    """Own a validated, unpublished PDF until explicitly discarded."""
+
+    def __init__(self, directory, path, stream):
+        self.directory = directory
+        self.path = path
+        self._stream = stream
+        self.source_snapshot = None
+        self.validated_digest = None
+        self._publication_attempted = False
+
+    def read_bytes(self):
+        """Read through the retained handle, including on Windows."""
+        if self._stream is None:
+            raise ValueError("Prepared PDF has been discarded")
+        position = self._stream.tell()
+        try:
+            self._stream.seek(0)
+            return self._stream.read()
+        finally:
+            self._stream.seek(position)
+
+    def discard(self):
+        # Keep resource references on failure so a subsequent call can retry.
+        if self._stream is not None:
+            self._stream.close()
+            self._stream = None
+        if self.path is not None:
+            _cleanup_staged_file(self.path)
+            self.path = None
+        if self.directory is not None:
+            _cleanup_stage_directory(self.directory)
+            self.directory = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        self.discard()
+
+
+def stage_annotated_pdf(source_path, annotations: Iterable, *,
+                        validate_inherited: bool = False,
+                        source_snapshot: SourceSnapshot | None = None) -> PreparedPdfOutput:
+    """Write and validate a private temporary PDF beside the unchanged source.
+
+    The caller owns the returned object and must discard it when finished.
+    This function provides no publication or in-place replacement operation.
+    """
+    source = Path(source_path).expanduser()
+    if not source.is_file():
+        raise ValueError("Source PDF does not exist or is not a regular file")
+    if os.name != "nt" and not sys.platform.startswith("linux"):
+        raise OSError("Safe descriptor-based staging is not supported on this platform")
+    source = source.resolve(strict=True)
+    if source_snapshot is not None:
+        if not validate_inherited:
+            raise ValueError("Source-bound staging requires inherited annotation validation")
+        if not isinstance(source_snapshot, SourceSnapshot) or source_snapshot.path.resolve(strict=True) != source:
+            raise ValueError("Source snapshot does not match the staged source")
+        verify_source_snapshot(source_snapshot)
+    reader, writer, expected = _build_annotated_pdf(source, annotations)
+    directory = _create_private_stage(source.parent, f".{source.name}.glyph-stage-")
+    path = directory / "validated-output.tmp"
+    prepared = PreparedPdfOutput(directory, None, None)
+    descriptor = None
+    try:
+        if os.name == "nt":
+            descriptor = _create_windows_stage_fd(path)
+        else:
+            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR
+                                 | getattr(os, "O_CLOEXEC", 0), 0o600)
+        prepared.path = path
+        prepared._stream = os.fdopen(descriptor, "w+b", buffering=0)
+        descriptor = None
+        digest = _write_validated_pdf(reader, writer, expected, prepared._stream,
+                                      capture_digest=source_snapshot is not None)
+        if validate_inherited:
+            _validate_inherited_annotations(reader, prepared._stream, expected)
+        if source_snapshot is not None:
+            verify_source_snapshot(source_snapshot)
+            if _stream_digest(prepared._stream) != digest:
+                raise ValueError("Staged PDF changed during validation")
+            prepared.validated_digest = digest
+            prepared.source_snapshot = source_snapshot
+        return prepared
+    except BaseException:
+        if descriptor is not None:
+            os.close(descriptor)
+        prepared.discard()
+        raise
+
+
+def _digest_fd(descriptor):
+    before = os.fstat(descriptor)
+    digest = hashlib.sha256()
+    offset = 0
+    while True:
+        block = os.pread(descriptor, 1024 * 1024, offset)
+        if not block:
+            break
+        digest.update(block)
+        offset += len(block)
+    if _posix_state(before) != _posix_state(os.fstat(descriptor)):
+        raise ValueError("File changed while hashing")
+    return digest.digest()
+
+
+def _verify_displaced_original(descriptor, snapshot):
+    # Exchange changes ctime. Identity, size, mtime and the content digest
+    # remain comparable; _digest_fd also checks stability during the read.
+    state = _posix_state(os.fstat(descriptor))
+    if state[:4] != snapshot.state[:4] or _digest_fd(descriptor) != snapshot.digest:
+        raise ValueError("Displaced source differs from the original snapshot")
+
+
+def publish_prepared_pdf_linux(prepared: PreparedPdfOutput) -> WriteResult:
+    """One-use Linux exchange of a snapshot-bound validated output.
+
+    Same-user writers can still race pathname checks or change files after the
+    checks. Ambiguous recovery leaves the staging directory as evidence.
+    """
+    if not isinstance(prepared, PreparedPdfOutput):
+        return WriteResult(False, error="A prepared PDF output is required")
+    if prepared._publication_attempted or prepared._stream is None:
+        return WriteResult(False, error="Prepared output was already consumed or discarded")
+    prepared._publication_attempted = True
+    stage_fd = dest_fd = original_fd = None
+    exchanged = verified = durable = preserve = False
+    error = None
+    snapshot = prepared.source_snapshot
+    destination = snapshot.path if isinstance(snapshot, SourceSnapshot) else None
+    evidence = prepared.directory
+    try:
+        if not sys.platform.startswith("linux"):
+            raise OSError("Prepared in-place publication is supported on Linux only")
+        if destination is None or prepared.validated_digest is None:
+            raise ValueError("Prepared output is not bound to a source snapshot")
+        stage_fd = _open_posix_directory(prepared.directory)
+        dest_fd = _open_posix_directory(destination.parent)
+        if _posix_identity(os.fstat(dest_fd)) != _posix_identity(os.stat(prepared.directory.parent)):
+            raise ValueError("Source directory changed since staging")
+        staged_fd = prepared._stream.fileno()
+        staged_identity = _posix_identity(os.fstat(staged_fd))
+        staged_entry = os.stat(prepared.path.name, dir_fd=stage_fd, follow_symlinks=False)
+        if not stat.S_ISREG(staged_entry.st_mode) or _posix_identity(staged_entry) != staged_identity:
+            raise ValueError("Staged file entry changed")
+        if _digest_fd(staged_fd) != prepared.validated_digest:
+            raise ValueError("Validated staged output changed")
+        original_fd = os.open(destination.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                              dir_fd=dest_fd)
+        original_stat = os.fstat(original_fd)
+        if not stat.S_ISREG(original_stat.st_mode) or _posix_state(original_stat) != snapshot.state:
+            raise ValueError("Source identity or metadata changed")
+        if _digest_fd(original_fd) != snapshot.digest:
+            raise ValueError("Source content changed")
+        verify_source_snapshot(snapshot)
+        current = os.stat(destination.name, dir_fd=dest_fd, follow_symlinks=False)
+        if _posix_state(current) != snapshot.state:
+            raise ValueError("Source changed before publication")
+        _rename_exchange(stage_fd, prepared.path.name, dest_fd, destination.name)
+        exchanged = True
+        try:
+            displaced = os.stat(prepared.path.name, dir_fd=stage_fd, follow_symlinks=False)
+            current = os.stat(destination.name, dir_fd=dest_fd, follow_symlinks=False)
+            if (_posix_identity(displaced) != _posix_identity(os.fstat(original_fd))
+                    or _posix_identity(current) != staged_identity):
+                raise ValueError("Exchanged entries do not match retained files")
+            _verify_displaced_original(original_fd, snapshot)
+            if _digest_fd(staged_fd) != prepared.validated_digest:
+                raise ValueError("Published staged content changed")
+            verified = True
+        except Exception as failure:
+            try:
+                displaced = os.stat(prepared.path.name, dir_fd=stage_fd, follow_symlinks=False)
+                current = os.stat(destination.name, dir_fd=dest_fd, follow_symlinks=False)
+                if (_posix_identity(displaced) != _posix_identity(os.fstat(original_fd))
+                        or _posix_identity(current) != staged_identity):
+                    raise RuntimeError("Exchange entries changed before rollback")
+                _rename_exchange(stage_fd, prepared.path.name, dest_fd, destination.name)
+                if (_posix_identity(os.stat(destination.name, dir_fd=dest_fd, follow_symlinks=False))
+                        != _posix_identity(os.fstat(original_fd))
+                        or _posix_identity(os.stat(prepared.path.name, dir_fd=stage_fd, follow_symlinks=False))
+                        != staged_identity):
+                    raise RuntimeError("Rollback identities could not be verified")
+                exchanged = False
+                os.fsync(dest_fd)
+                os.fsync(stage_fd)
+            except Exception as rollback_error:
+                preserve = True
+                raise RuntimeError(f"Publication state ambiguous; evidence retained in {evidence}: {rollback_error}") from failure
+            raise ValueError(f"Publication rejected and original entry restored: {failure}") from failure
+        os.fsync(dest_fd)
+        durable = True
+        os.fsync(stage_fd)
+        os.unlink(prepared.path.name, dir_fd=stage_fd)
+        prepared.path = None
+        os.fsync(stage_fd)
+    except Exception as failure:
+        error = f"{type(failure).__name__}: {failure}"
+        if exchanged and prepared.path is not None:
+            preserve = True
+            error += f"; staging evidence retained in {evidence}"
+    finally:
+        for descriptor in (original_fd, dest_fd, stage_fd):
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError as failure:
+                    error = f"{error + '; ' if error else ''}close descriptor: {failure}"
+        if preserve:
+            # The name may now contain the original; never discard it.
+            prepared.path = None
+            prepared.directory = None
+        try:
+            prepared.discard()
+        except Exception as failure:
+            error = f"{error + '; ' if error else ''}cleanup failed: {failure}"
+    return WriteResult(error is None, destination if exchanged and verified else None,
+                       error, exchanged, durable)
+
+
+def publish_prepared_pdf_windows(prepared: PreparedPdfOutput) -> WriteResult:
+    """Replace a trusted local source using the retained validated Windows handle.
+
+    Destination and ancestor directories must be trusted: the absolute path is
+    resolved again by Windows during rename, and can otherwise be redirected.
+    """
+    if not isinstance(prepared, PreparedPdfOutput):
+        return WriteResult(False, error="A prepared PDF output is required")
+    if prepared._publication_attempted or prepared._stream is None:
+        return WriteResult(False, error="Prepared output was already consumed or discarded")
+    prepared._publication_attempted = True
+    snapshot = prepared.source_snapshot
+    destination = snapshot.path if isinstance(snapshot, SourceSnapshot) else None
+    target_handle = None
+    published = verified = False
+    error = None
+    try:
+        if os.name != "nt":
+            raise OSError("Windows prepared publication is supported on Windows only")
+        if destination is None or prepared.validated_digest is None:
+            raise ValueError("Prepared output is not bound to a source snapshot")
+        # Reject unsupported paths before locking or attempting replacement.
+        _windows_replace_buffer(str(destination))
+        import msvcrt
+        staged_handle = msvcrt.get_osfhandle(prepared._stream.fileno())
+        staged_identity = _windows_file_identity(staged_handle)
+        if not any(staged_identity[1]):
+            raise ValueError("Staged file identity cannot be verified")
+        before = os.fstat(prepared._stream.fileno())
+        if _stream_digest(prepared._stream) != prepared.validated_digest:
+            raise ValueError("Validated staged output changed")
+        if _posix_state(before) != _posix_state(os.fstat(prepared._stream.fileno())):
+            raise ValueError("Staged output changed while hashing")
+        target = _open_windows_replacement_target(destination)
+        if target is None:
+            raise FileNotFoundError("Source PDF no longer exists")
+        target_handle, target_identity = target
+        if not any(target_identity[1]) or target_identity == staged_identity:
+            raise ValueError("Source file identity cannot be verified")
+        verify_source_snapshot(snapshot)
+        path_identity, attributes = _windows_path_identity(destination, open_reparse=True)
+        if (attributes is None or attributes & (0x10 | 0x400)
+                or path_identity != target_identity
+                or _windows_file_identity(target_handle) != target_identity):
+            raise ValueError("Source file changed before publication")
+        _windows_replace_by_handle(staged_handle, str(destination))
+        published = True
+        # The retained staging file was renamed. Never unlink its former name.
+        prepared.path = None
+        _windows_verify_published_file(staged_handle, str(destination))
+        verified = True
+        if (_windows_file_identity(staged_handle) != staged_identity
+                or _stream_digest(prepared._stream) != prepared.validated_digest):
+            raise ValueError("Published PDF differs from the validated output")
+    except Exception as failure:
+        error = f"{type(failure).__name__}: {failure}"
+        if published and not verified:
+            error = f"PDF was published but its destination could not be verified; actual location is unknown: {error}"
+    finally:
+        if target_handle is not None:
+            try:
+                if not _windows_api().CloseHandle(target_handle):
+                    raise ctypes.WinError(ctypes.get_last_error())
+            except Exception as failure:
+                error = f"{error + '; ' if error else ''}close source handle: {failure}"
+        try:
+            prepared.discard()
+        except Exception as failure:
+            error = f"{error + '; ' if error else ''}cleanup failed: {failure}"
+    return WriteResult(error is None, destination if published and verified else None,
+                       error, published, False, WINDOWS_DURABILITY_WARNING if published else None)
+
+
+def publish_prepared_pdf(prepared: PreparedPdfOutput) -> WriteResult:
+    """Publish a snapshot-bound output using the current platform's safeguards."""
+    if os.name == "nt":
+        return publish_prepared_pdf_windows(prepared)
+    return publish_prepared_pdf_linux(prepared)
+
+
 def write_annotated_pdf(source_path, destination_path, annotations: Iterable, *,
                         replacement_target: PreparedReplacement | None = None) -> WriteResult:
     """Write and validate annotations before safely publishing the retained file.
@@ -797,37 +1289,7 @@ def write_annotated_pdf(source_path, destination_path, annotations: Iterable, *,
         if replacement_target is not None:
             _verify_prepared_replacement(source_resolved, destination, replacement_target)
 
-        snapshot = tuple(annotations)
-        generations = {item.generation for item in snapshot}
-        if len(generations) > 1:
-            raise ValueError("Annotation snapshot mixes document generations")
-        reader = PdfReader(source_resolved, strict=True)
-        if reader.is_encrypted:
-            raise ValueError("Encrypted PDFs are not supported by annotation persistence")
-        if _contains_signature_marker(reader):
-            raise ValueError("Signed PDFs are not supported by annotation persistence")
-        qt_sizes = _qt_page_sizes(source_resolved)
-        if len(qt_sizes) != len(reader.pages):
-            raise ValueError("QtPdf and pypdf reported different page counts")
-
-        writer = PdfWriter(clone_from=reader)
-        expected = {}
-        for item in snapshot:
-            if (not isinstance(item.page, int) or isinstance(item.page, bool)
-                    or not 0 <= item.page < len(reader.pages)):
-                raise ValueError("Annotation page is outside the source PDF")
-            if item.id in expected:
-                raise ValueError("Annotation snapshot contains duplicate ids")
-            geometry = PageGeometry.from_page(reader.pages[item.page], qt_sizes[item.page])
-            annotation = convert_annotation(item, geometry)
-            appearance = annotation.get("/AP")
-            if appearance is not None:
-                normal = appearance.get("/N")
-                if normal is not None and not isinstance(normal, IndirectObject):
-                    appearance[NameObject("/N")] = writer._add_object(normal)
-            record = _annotation_record(item.page, annotation)
-            writer.add_annotation(item.page, annotation)
-            expected[item.id] = record
+        reader, writer, expected = _build_annotated_pdf(source_resolved, annotations)
 
         stage_directory = _create_private_stage(
             destination_parent, f".{destination.name}.glyph-stage-")
@@ -854,10 +1316,7 @@ def write_annotated_pdf(source_path, destination_path, annotations: Iterable, *,
         # file-position state while retaining the publication handle.
         stream = os.fdopen(unowned_descriptor, "w+b", buffering=0)
         unowned_descriptor = None
-        writer.write(stream)
-        stream.flush()
-        os.fsync(stream.fileno())
-        _validate_output(reader, stream, expected)
+        _write_validated_pdf(reader, writer, expected, stream)
         if replacement_target is not None:
             _verify_prepared_replacement(source_resolved, destination, replacement_target)
 

@@ -131,6 +131,14 @@ handle. If that check fails, it reports `success=False`, `published=True`,
 `output_path=None`, and an unknown actual location; it does not delete the
 published file. This check does not eliminate the directory-redirection race.
 
+The experimental prepared-output publication API uses the same Windows trust
+boundary. It pins the original file against new writes and deletes, checks the
+previously captured source snapshot and staged content digest, and renames the
+retained staged handle. It still resolves the absolute destination at rename,
+so callers must use a trusted local directory and trusted ancestors. It does not
+provide adversarial directory safety, Windows parent-directory crash durability,
+or Qt document teardown. Native Windows validation of this API remains pending.
+
 ## Rendering and preservation limits
 
 Glyph requests QtPdf's annotation render flag for both reader pages and
