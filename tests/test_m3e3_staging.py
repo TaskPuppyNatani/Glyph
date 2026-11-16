@@ -1,6 +1,7 @@
 import os
 import io
 import tempfile
+from types import SimpleNamespace
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -108,3 +109,43 @@ class StagingTests(unittest.TestCase):
             replacement.replace(source)
             with self.assertRaises(ValueError):
                 pdf_writer.verify_source_snapshot(current)
+
+    def test_windows_snapshot_ignores_path_handle_creation_time_difference(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = _core_fixture(root / "source.pdf")
+            generated = root / "glyph-output.pdf"
+            result = pdf_writer.write_annotated_pdf(source, generated, ())
+            self.assertTrue(result.success, result.error)
+            real_fstat = os.fstat
+
+            def handle_stat(descriptor):
+                info = real_fstat(descriptor)
+                return SimpleNamespace(st_mode=info.st_mode, st_dev=info.st_dev,
+                                       st_ino=info.st_ino, st_size=info.st_size,
+                                       st_mtime_ns=info.st_mtime_ns,
+                                       st_ctime_ns=info.st_ctime_ns + 13136500)
+
+            with patch.object(pdf_writer.os, "fstat", side_effect=handle_stat):
+                with patch.object(pdf_writer.sys, "platform", "linux"):
+                    with self.assertRaisesRegex(ValueError, "changed while opening"):
+                        pdf_writer.capture_source_snapshot(generated)
+                with patch.object(pdf_writer.sys, "platform", "win32"):
+                    snapshot = pdf_writer.capture_source_snapshot(generated)
+                    pdf_writer.verify_source_snapshot(snapshot)
+                    self.assertEqual(len(snapshot.state), 4)
+                    original = generated.stat()
+                    with generated.open("r+b") as stream:
+                        stream.seek(10)
+                        byte = stream.read(1)
+                        stream.seek(10)
+                        stream.write(bytes([byte[0] ^ 1]))
+                    os.utime(generated, ns=(original.st_atime_ns, original.st_mtime_ns))
+                    with self.assertRaisesRegex(ValueError, "changed"):
+                        pdf_writer.verify_source_snapshot(snapshot)
+                    current = pdf_writer.capture_source_snapshot(generated)
+                    replacement = root / "replacement.pdf"
+                    replacement.write_bytes(generated.read_bytes())
+                    replacement.replace(generated)
+                    with self.assertRaisesRegex(ValueError, "changed"):
+                        pdf_writer.verify_source_snapshot(current)

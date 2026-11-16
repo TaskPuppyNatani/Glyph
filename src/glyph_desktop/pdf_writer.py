@@ -56,6 +56,13 @@ class SourceSnapshot:
     digest: bytes
 
 
+def _source_snapshot_state(info):
+    state = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+    # On Windows path and handle creation-time values can differ even for the
+    # same file. Identity, modification time, size and the digest still apply.
+    return state if sys.platform == "win32" else (*state, info.st_ctime_ns)
+
+
 def capture_source_snapshot(path) -> SourceSnapshot:
     """Capture a stable observation; reject links and files changing during reading."""
     path = Path(path).expanduser().absolute()
@@ -68,9 +75,7 @@ def capture_source_snapshot(path) -> SourceSnapshot:
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode) or not before.st_ino:
             raise ValueError("Source identity cannot be verified as a regular file")
-        def state(info):
-            return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
-        if state(before_path) != state(before):
+        if _source_snapshot_state(before_path) != _source_snapshot_state(before):
             raise ValueError("Source changed while opening it")
         digest = hashlib.sha256()
         while True:
@@ -80,9 +85,10 @@ def capture_source_snapshot(path) -> SourceSnapshot:
             digest.update(block)
         after = os.fstat(descriptor)
         after_path = os.lstat(path)
-        if state(before) != state(after) or state(before) != state(after_path):
+        if (_source_snapshot_state(before) != _source_snapshot_state(after)
+                or _source_snapshot_state(before) != _source_snapshot_state(after_path)):
             raise ValueError("Source changed while reading it")
-        return SourceSnapshot(path, state(before), digest.digest())
+        return SourceSnapshot(path, _source_snapshot_state(before), digest.digest())
     finally:
         os.close(descriptor)
 
