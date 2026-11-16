@@ -1,6 +1,7 @@
 """Convert immutable Glyph annotation records to native pypdf annotations."""
 
 import math
+from datetime import datetime, timezone
 
 from pypdf.annotations import Highlight, Text
 from pypdf.generic import (ArrayObject, DecodedStreamObject, DictionaryObject,
@@ -78,12 +79,16 @@ def _markup_appearance(kind, quads, rect, color, width):
 
 
 def convert_annotation(item, geometry: PageGeometry):
-    """Return one native PDF annotation dictionary for a Glyph record."""
+    """Return a PDF annotation; note dates reflect export, not original creation."""
     if isinstance(item, Note) and item.kind == "note":
         x, y = geometry.qt_to_pdf(item.anchor)
         half = NOTE_RECT_SIZE / 2
         annotation = Text(rect=(x - half, y - half, x + half, y + half),
                           text=item.text, flags=4)
+        # Glyph notes do not retain a creation time; both dates use export time.
+        timestamp = datetime.now(timezone.utc).strftime("D:%Y%m%d%H%M%SZ")
+        annotation[NameObject("/M")] = TextStringObject(timestamp)
+        annotation[NameObject("/CreationDate")] = TextStringObject(timestamp)
         annotation[NameObject("/Name")] = NameObject("/Comment")
         annotation[NameObject("/C")] = _color((151, 121, 40))
         return _set_common(annotation, item.id, 235 / 255)
