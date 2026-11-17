@@ -698,6 +698,13 @@ class NoteMenuTests(unittest.TestCase):
         self.assertFalse(self.reader.edit_note_action.isEnabled())
         self.assertIn("Right-click a note to edit it", texts)
 
+    def test_annotation_menu_save_hint_is_disabled(self):
+        menu = next(m for m in self.window.findChildren(QMenu) if m.title() == "&Annotation")
+        hints = [action for action in menu.actions()
+                 if action.text() == "Annotations are included with Save and Save As…"]
+        self.assertEqual(len(hints), 1)
+        self.assertFalse(hints[0].isEnabled())
+
     def test_note_action_from_the_menu_places_and_undoes_a_note(self):
         self.reader.note_action.trigger()
         self.assertTrue(self.view.note_mode)

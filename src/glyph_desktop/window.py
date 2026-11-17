@@ -56,7 +56,7 @@ class MainWindow(QMainWindow):
         edit.addAction(self.reader.copy_action)
         edit.addAction(self.reader.select_all_action)
         annotations = self.menuBar().addMenu("&Annotation")
-        annotations.addAction("Annotations are included with Save As…").setEnabled(False)
+        annotations.addAction("Annotations are included with Save and Save As…").setEnabled(False)
         annotations.addAction("Alt+click markup on links to select").setEnabled(False)
         annotations.addAction("Right-click a note to edit it").setEnabled(False)
         annotations.addSeparator()
