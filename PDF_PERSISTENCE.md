@@ -83,6 +83,13 @@ directory entry atomically without deleting the old file before validation.
 The source PDF, including hard links to it, is never accepted as a replacement
 target. Existing-target replacement is implemented for Linux and Windows only.
 
+On the user's Linux `fuseblk` filesystem, in-place Save failed with `Errno 22`;
+Save As to a new file on that filesystem succeeded, and in-place Save succeeded
+on a native Linux filesystem. Lack of `renameat2(RENAME_EXCHANGE)` support is a
+suspected cause, not an independently confirmed diagnosis. Safe in-place
+publication on NTFS/FUSE remains a separate future task; Glyph currently fails
+closed when atomic exchange is unavailable.
+
 Both validators read from the retained, unbuffered staging descriptor without
 reopening its pathname. QtPdf loads a seekable `QFile` device wrapping that
 descriptor with `DontCloseHandle`; the document and device are closed before
