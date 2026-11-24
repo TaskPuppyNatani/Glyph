@@ -15,3 +15,7 @@ htmlcov/
 .vscode/
 *.tmp
 *~
+
+# Local AI development policies
+/CODEX-USAGE-SUBAGENT-POLICY*.MD
+/MODEL-NEUTRAL-USAGE-SUBAGENT-POLICY*.MD
