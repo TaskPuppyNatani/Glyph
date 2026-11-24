@@ -3,7 +3,7 @@
 Glyph is a local-first desktop PDF application in development for Windows and Linux.
 Glyph opens local PDFs in a continuous, vertically scrolling reader with page
 navigation, zoom, and a toggleable thumbnail sidebar. Text markup, freehand ink,
-and note annotations can be saved to the open PDF with File → Save (Ctrl+S), or
+rectangles, and notes can be saved to the open PDF with File → Save (Ctrl+S), or
 written to a separate copy with File → Save As. Save As leaves the original
 open, and replacing an existing export requires explicit confirmation. The
 persistence writer otherwise refuses to replace existing files. Existing PDF

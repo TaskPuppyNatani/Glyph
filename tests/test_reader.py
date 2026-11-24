@@ -14,7 +14,7 @@ from PySide6.QtGui import QImage, QKeyEvent, QPainter, QPdfWriter, QWheelEvent
 from PySide6.QtWidgets import QApplication
 from pypdf import PdfReader
 
-from glyph_desktop.annotations import Ink, Markup, Note
+from glyph_desktop.annotations import Ink, Markup, Note, Rectangle
 from glyph_desktop.pdf_geometry import PageGeometry
 from glyph_desktop.pdf_writer import write_annotated_pdf
 from glyph_desktop.reader import (Document, PageCanvas, Reader,
@@ -507,6 +507,8 @@ class ReaderTests(unittest.TestCase):
             Ink("reopened-ink", "ink", 0, generation,
                 tuple(geometry.pdf_to_qt(point)
                       for point in ((200, 350), (220, 370), (240, 360))), 2.5),
+            Rectangle("reopened-rectangle", "rectangle", 0, generation,
+                      (180.0, 200.0, 280.0, 275.0)),
         ]
 
         for annotation in annotations:

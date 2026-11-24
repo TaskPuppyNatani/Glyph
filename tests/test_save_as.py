@@ -8,10 +8,10 @@ from unittest.mock import Mock, PropertyMock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QCoreApplication, QEvent, QSettings, Qt
+from PySide6.QtCore import QCoreApplication, QEvent, QPointF, QSettings, Qt
 from PySide6.QtGui import QPainter, QPdfWriter, QKeySequence
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QFileDialog, QDialog, QMessageBox
+from PySide6.QtWidgets import QApplication, QFileDialog, QDialog, QMenu, QMessageBox
 from pypdf import PdfReader
 
 from glyph_desktop.annotations import Annotations, Markup
@@ -102,6 +102,75 @@ class SaveAsTests(unittest.TestCase):
         self.assertTrue(self.window.open_document(self.source))
         self.app.processEvents()
 
+    def draw_rectangle(self, top_left, bottom_right):
+        reader = self.window.reader
+        view = reader.page_view
+        menu = next(menu for menu in self.window.findChildren(QMenu)
+                    if menu.title() == "&Annotation")
+        action = reader.rectangle_action
+        self.assertIn(action, menu.actions())
+        self.assertTrue(action.isEnabled())
+        if not action.isChecked():
+            action.trigger()
+        start = view.pdf_to_viewport(0, QPointF(*top_left)).toPoint()
+        end = view.pdf_to_viewport(0, QPointF(*bottom_right)).toPoint()
+        count = len(reader.annotations.items)
+        button = Qt.MouseButton.LeftButton
+        QTest.mousePress(view.viewport(), button, pos=start)
+        QTest.mouseMove(view.viewport(), end)
+        QTest.mouseRelease(view.viewport(), button, pos=end)
+        self.assertEqual(len(reader.annotations.items), count + 1)
+        rectangle = reader.annotations.items[-1]
+        self.assertEqual(rectangle.kind, "rectangle")
+        return rectangle
+
+    def test_drawn_rectangles_survive_repeated_ctrl_s_with_another_annotation(self):
+        self.open_source()
+        reader = self.window.reader
+        first = self.draw_rectangle((80, 100), (210, 180))
+        self.window.activateWindow()
+        self.app.processEvents()
+        with patch("glyph_desktop.window.QMessageBox.warning") as warning:
+            QTest.keyClick(self.window, Qt.Key.Key_S, Qt.KeyboardModifier.ControlModifier)
+            warning.assert_not_called()
+            self.assertEqual(reader.annotations.items, ())
+            self.assertFalse(reader.annotations.can_undo)
+            page = PdfReader(self.source, strict=True).pages[0]
+            self.assertEqual([(str(ref.get_object()["/NM"]), str(ref.get_object()["/Subtype"]))
+                              for ref in page["/Annots"]], [(first.id, "/Square")])
+            saved = self.source.read_bytes()
+            QTest.keyClick(self.window, Qt.Key.Key_S, Qt.KeyboardModifier.ControlModifier)
+            self.assertEqual(self.source.read_bytes(), saved)
+
+            second = self.draw_rectangle((250, 140), (370, 230))
+            note = reader.annotations.add_note(0, (425, 230), "Saved alongside rectangles")
+            QTest.keyClick(self.window, Qt.Key.Key_S, Qt.KeyboardModifier.ControlModifier)
+            warning.assert_not_called()
+
+        self.assertEqual(reader.annotations.items, ())
+        self.assertEqual(self.window.document.path, self.source.resolve())
+        page = PdfReader(self.source, strict=True).pages[0]
+        annotations = [ref.get_object() for ref in page["/Annots"]]
+        self.assertCountEqual([(str(item["/NM"]), str(item["/Subtype"])) for item in annotations],
+                              [(first.id, "/Square"), (second.id, "/Square"), (note.id, "/Text")])
+
+    def test_drawn_rectangle_is_written_by_save_as(self):
+        self.open_source()
+        source_bytes = self.source.read_bytes()
+        rectangle = self.draw_rectangle((80, 100), (210, 180))
+        destination = self.root / "rectangle-copy.pdf"
+        _, dialog_patch = self.file_dialog(destination)
+        with dialog_patch, patch("glyph_desktop.window.QMessageBox.warning") as warning:
+            self.window.save_as_action.trigger()
+        warning.assert_not_called()
+        self.assertEqual(self.source.read_bytes(), source_bytes)
+        self.assertEqual(self.window.reader.annotations.items, (rectangle,))
+        page = PdfReader(destination, strict=True).pages[0]
+        saved, = (ref.get_object() for ref in page["/Annots"])
+        self.assertEqual((str(saved["/NM"]), str(saved["/Subtype"])), (rectangle.id, "/Square"))
+        self.assertTrue(self.window.open_document(destination))
+        self.assertEqual(self.window.reader.annotations.items, ())
+
     def test_save_action_and_successful_in_place_save_are_repeatable(self):
         action = self.window.save_action
         self.assertFalse(action.isEnabled())
@@ -141,9 +210,12 @@ class SaveAsTests(unittest.TestCase):
 
     def test_save_failure_restores_session_and_history(self):
         self.open_source()
+        rectangle = self.draw_rectangle((80, 120), (210, 200))
         note = self.window.reader.annotations.add_note(0, (80, 100), "before")
         self.window.reader.annotations.update_note_text(note.id, "after")
-        self.window.reader.annotations.undo()
+        annotations = self.window.reader.annotations
+        self.assertTrue(annotations.undo())
+        annotations.select(rectangle.id, self.window.document.generation)
         before = self.source.read_bytes()
         def fail(prepared):
             prepared.discard()
@@ -154,9 +226,12 @@ class SaveAsTests(unittest.TestCase):
         warning.assert_called_once()
         self.assertEqual(self.source.read_bytes(), before)
         self.assertIsNone(self.window.reader.pending_session_recovery)
-        self.assertEqual(self.window.reader.annotations.get(note.id).text, "before")
-        self.assertTrue(self.window.reader.annotations.redo())
-        self.assertEqual(self.window.reader.annotations.get(note.id).text, "after")
+        self.assertEqual(annotations.get(rectangle.id),
+                         replace(rectangle, generation=self.window.document.generation))
+        self.assertEqual(annotations.selected_id, rectangle.id)
+        self.assertEqual(annotations.get(note.id).text, "before")
+        self.assertTrue(annotations.redo())
+        self.assertEqual(annotations.get(note.id).text, "after")
 
     def test_save_rejects_modified_source_without_losing_session(self):
         self.open_source()

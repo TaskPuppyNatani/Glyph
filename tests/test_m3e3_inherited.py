@@ -16,7 +16,8 @@ from PySide6.QtWidgets import QApplication
 from glyph_desktop.pdf_geometry import PageGeometry
 from glyph_desktop import pdf_writer
 from glyph_desktop.pdf_writer import stage_annotated_pdf, write_annotated_pdf
-from test_m3e1b_persistence import _items, _qt_page_sizes, _core_fixture
+from test_m3e1b_persistence import (_items, _rectangle, _qt_page_sizes,
+                                   _core_fixture)
 
 
 class InheritedValidationTests(unittest.TestCase):
@@ -35,13 +36,14 @@ class InheritedValidationTests(unittest.TestCase):
         writer.write(blank)
         page = PdfReader(blank).pages[0]
         geometry = PageGeometry.from_page(page, _qt_page_sizes(blank)[0])
-        self.items = _items(geometry)
+        self.items = (*_items(geometry),
+                      _rectangle(geometry, item_id="inherited-square"))
         self.source = self.root / "source.pdf"
         result = write_annotated_pdf(blank, self.source, self.items)
         self.assertTrue(result.success, result.error)
         self.original = self.source.read_bytes()
 
-    def test_existing_five_types_and_new_annotation(self):
+    def test_existing_six_types_including_square_and_new_annotation(self):
         extra = replace(self.items[0], id="additional-note")
         with stage_annotated_pdf(self.source, (extra,), validate_inherited=True) as staged:
             self.assertTrue(staged.read_bytes().startswith(b"%PDF"))
@@ -74,11 +76,17 @@ class InheritedValidationTests(unittest.TestCase):
 
     def test_detects_lost_changed_duplicate_and_appearance(self):
         write = PdfWriter.write
-        for mutation in ("missing", "geometry", "contents", "flags", "appearance", "duplicate", "relocated"):
+        for mutation in ("missing", "geometry", "contents", "flags", "appearance",
+                         "duplicate", "relocated", "square_geometry", "square_color",
+                         "square_width", "square_flags", "square_appearance",
+                         "square_interior", "square_matrix", "square_form_type",
+                         "square_float_flags", "square_page_reference"):
             with self.subTest(mutation=mutation):
                 def altered(writer, output):
                     annotations = writer.pages[0]["/Annots"]
                     note = annotations[0].get_object()
+                    square = next(reference.get_object() for reference in annotations
+                                  if str(reference.get_object().get("/Subtype")) == "/Square")
                     if mutation == "missing":
                         del annotations[0]
                     elif mutation == "geometry":
@@ -91,6 +99,28 @@ class InheritedValidationTests(unittest.TestCase):
                         annotations.append(annotations[0])
                     elif mutation == "relocated":
                         writer.pages[1][NameObject("/Annots")] = ArrayObject([annotations.pop(0)])
+                    elif mutation == "square_geometry":
+                        square[NameObject("/Rect")] = ArrayObject([FloatObject(0)] * 4)
+                    elif mutation == "square_color":
+                        square[NameObject("/C")] = ArrayObject([FloatObject(0)] * 3)
+                    elif mutation == "square_width":
+                        square["/BS"][NameObject("/W")] = FloatObject(5)
+                    elif mutation == "square_flags":
+                        square[NameObject("/F")] = NumberObject(0)
+                    elif mutation == "square_appearance":
+                        square["/AP"]["/N"].get_object().set_data(b"q 0 0 m S Q\n")
+                    elif mutation == "square_interior":
+                        square[NameObject("/IC")] = ArrayObject([FloatObject(1)] * 3)
+                    elif mutation == "square_matrix":
+                        square["/AP"]["/N"].get_object()[NameObject("/Matrix")] = ArrayObject(
+                            [FloatObject(1), FloatObject(0), FloatObject(0),
+                             FloatObject(1), FloatObject(0), FloatObject(0)])
+                    elif mutation == "square_form_type":
+                        square["/AP"]["/N"].get_object()[NameObject("/FormType")] = FloatObject(1.9)
+                    elif mutation == "square_float_flags":
+                        square[NameObject("/F")] = FloatObject(4.9)
+                    elif mutation == "square_page_reference":
+                        square[NameObject("/P")] = writer.pages[1].indirect_reference
                     else:
                         markup = annotations[1].get_object()
                         appearance = markup["/AP"]["/N"].get_object()

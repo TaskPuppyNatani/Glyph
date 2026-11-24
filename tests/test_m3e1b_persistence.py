@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
 
@@ -20,12 +21,13 @@ from pypdf.annotations import Link, Text
 from pypdf.generic import (ArrayObject, DictionaryObject, FloatObject, NameObject,
                            NumberObject, RectangleObject, TextStringObject)
 
-from glyph_desktop.annotations import Ink, Markup, Note
+from glyph_desktop.annotations import (Ink, Markup, Note, Rectangle,
+                                       RECTANGLE_COLOR, RECTANGLE_WIDTH)
 from glyph_desktop.pdf_annotations import convert_annotation
 from glyph_desktop.pdf_geometry import GeometryError, PageGeometry
 from glyph_desktop.pdf_writer import (_annotation_record, _create_private_stage,
                                      _matches_annotation, prepare_replacement_target,
-                                     write_annotated_pdf)
+                                     stage_annotated_pdf, write_annotated_pdf)
 from test_links import write_link_pdf
 
 
@@ -90,6 +92,16 @@ def _items(geometry, page=0):
     points = tuple(geometry.pdf_to_qt(point) for point in ((200, 350), (220, 370), (240, 360)))
     ink = Ink("ink-id", "ink", page, 7, points, 2.5)
     return (note, *markups, ink)
+
+
+def _rectangle(geometry, page=0, item_id="rectangle-id",
+               pdf_rect=(120, 450, 180, 500)):
+    left, bottom, right, top = pdf_rect
+    corners = tuple(geometry.pdf_to_qt(point) for point in
+                    ((left, bottom), (left, top), (right, bottom), (right, top)))
+    xs, ys = [point[0] for point in corners], [point[1] for point in corners]
+    return Rectangle(item_id, "rectangle", page, 7,
+                     (min(xs), min(ys), max(xs), max(ys)))
 
 
 def _rect(annotation):
@@ -283,6 +295,143 @@ class PersistenceFoundationTests(unittest.TestCase):
                 self.assertEqual(tuple(float(value) for value in ink["/C"]),
                                  tuple(value / 255 for value in (24, 32, 44)))
                 self.assertEqual(_rect(ink), (198.75, 348.75, 241.25, 371.25))
+
+    def test_rectangle_roundtrips_as_styled_native_square_on_crop_and_rotations(self):
+        for rotation in (0, 90, 180, 270):
+            with self.subTest(rotation=rotation):
+                source = _geometry_pdf(self.root / f"square-source-{rotation}.pdf", rotation)
+                reader = PdfReader(source, strict=True)
+                geometry = PageGeometry.from_page(reader.pages[0], _qt_page_sizes(source)[0])
+                item = _rectangle(geometry, item_id=f"square-{rotation}")
+                converted = convert_annotation(item, geometry)
+
+                self.assertEqual(str(converted["/Subtype"]), "/Square")
+                self.assertEqual(_rect(converted), (120, 450, 180, 500))
+                self.assertEqual(str(converted["/NM"]), item.id)
+                self.assertEqual(int(converted["/F"]), 4)
+                self.assertEqual(tuple(float(value) for value in converted["/C"]),
+                                 tuple(channel / 255 for channel in RECTANGLE_COLOR))
+                self.assertEqual(float(converted["/BS"]["/W"]), RECTANGLE_WIDTH)
+                self.assertNotIn("/IC", converted)
+                appearance = converted["/AP"]["/N"]
+                self.assertEqual(tuple(float(value) for value in appearance["/BBox"]),
+                                 (0, 0, 60, 50))
+                appearance_data = appearance.get_data()
+                self.assertIn(b" RG\n", appearance_data)
+                self.assertIn(b" w\n", appearance_data)
+                self.assertIn(b"h S\n", appearance_data)
+                self.assertNotIn(b" f", appearance_data)
+
+                destination = self.root / f"square-output-{rotation}.pdf"
+                result = write_annotated_pdf(source, destination, (item,))
+                self.assertTrue(result.success, result.error)
+                output = PdfReader(destination, strict=True)
+                saved = [reference.get_object() for reference in output.pages[0]["/Annots"]
+                         if str(reference.get_object().get("/NM", "")) == item.id]
+                self.assertEqual(len(saved), 1)
+                self.assertEqual(str(saved[0]["/Subtype"]), "/Square")
+                self.assertEqual(_rect(saved[0]), (120, 450, 180, 500))
+                self.assertEqual(int(saved[0]["/F"]), 4)
+
+    def test_rectangle_converter_rejects_invalid_or_out_of_page_geometry(self):
+        source = _geometry_pdf(self.root / "square-invalid-source.pdf")
+        geometry = PageGeometry.from_page(PdfReader(source).pages[0], _qt_page_sizes(source)[0])
+        for invalid in ((10, 10, 10, 20), (10, 10, 20, 10),
+                        (10, 10, math.inf, 20), (10, 10, math.nan, 20),
+                        (-1, 10, 20, 30), (10, 10, geometry.qt_width + 1, 30),
+                        (True, 10, 20, 30), (10, None, 20, 30)):
+            with self.subTest(rect=invalid):
+                item = Rectangle("invalid-square", "rectangle", 0, 7, invalid)
+                with self.assertRaises(GeometryError):
+                    convert_annotation(item, geometry)
+
+    def test_fractional_square_remains_valid_in_a_later_staged_save(self):
+        source = self.root / "fractional-square-source.pdf"
+        writer = PdfWriter()
+        page = writer.add_blank_page(width=600, height=800)
+        page.mediabox = RectangleObject([10, 20, 610, 820])
+        page.cropbox = RectangleObject([50, 100, 550, 700])
+        page.rotation = 90
+        writer.write(source)
+        geometry = PageGeometry.from_page(PdfReader(source).pages[0],
+                                          _qt_page_sizes(source)[0])
+        item = _rectangle(geometry, item_id="fractional-square",
+                          pdf_rect=(120.1234567, 450.9876543, 180.7654321, 500.2345678))
+        first = self.root / "fractional-square-first.pdf"
+        result = write_annotated_pdf(source, first, (item,))
+        self.assertTrue(result.success, result.error)
+
+        with stage_annotated_pdf(first, (), validate_inherited=True) as staged:
+            retained_stream = staged._stream
+            stream_position = retained_stream.tell()
+            staged_reader = PdfReader(BytesIO(staged.read_bytes()), strict=True)
+            saved = [reference.get_object() for reference in
+                     staged_reader.pages[0]["/Annots"]
+                     if str(reference.get_object().get("/NM", "")) == item.id]
+            self.assertIs(staged._stream, retained_stream)
+            self.assertFalse(retained_stream.closed)
+            self.assertEqual(retained_stream.tell(), stream_position)
+            self.assertEqual(len(saved), 1)
+            self.assertEqual(str(saved[0]["/Subtype"]), "/Square")
+
+    def test_square_appearance_is_visible_and_unfilled_after_qtpdf_reopen(self):
+        for rotation in (0, 90, 180, 270):
+            with self.subTest(rotation=rotation):
+                source = _geometry_pdf(self.root / f"square-render-source-{rotation}.pdf", rotation)
+                geometry = PageGeometry.from_page(PdfReader(source).pages[0],
+                                                  _qt_page_sizes(source)[0])
+                item = _rectangle(geometry, item_id=f"render-square-{rotation}")
+                destination = self.root / f"square-render-output-{rotation}.pdf"
+                result = write_annotated_pdf(source, destination, (item,))
+                self.assertTrue(result.success, result.error)
+
+                points = tuple(geometry.pdf_to_qt(point) for point in
+                               ((120, 450), (120, 500), (180, 450), (180, 500)))
+                xs, ys = [point[0] for point in points], [point[1] for point in points]
+                left, top, right, bottom = min(xs), min(ys), max(xs), max(ys)
+                bounds = _render_difference_bounds(source, destination)
+                self.assertIsNotNone(bounds)
+                x0, y0, x1, y1 = bounds
+                self.assertLessEqual(abs(x0 - left), 3)
+                self.assertLessEqual(abs(y0 - top), 3)
+                self.assertLessEqual(abs(x1 - right), 3)
+                self.assertLessEqual(abs(y1 - bottom), 3)
+                center = (round((left + right) / 2), round((top + bottom) / 2))
+                border = (round(left + 1), round((top + bottom) / 2))
+                self.assertEqual(_render_difference_at(source, destination,
+                                                       (center, border)), (False, True))
+
+    def test_square_output_validation_rejects_style_and_appearance_changes(self):
+        source = _geometry_pdf(self.root / "square-validation-source.pdf")
+        geometry = PageGeometry.from_page(PdfReader(source).pages[0], _qt_page_sizes(source)[0])
+        item = _rectangle(geometry)
+        original_write = PdfWriter.write
+        for mutation in ("color", "width", "flags", "appearance", "interior", "matrix"):
+            with self.subTest(mutation=mutation):
+                destination = self.root / f"square-validation-{mutation}.pdf"
+
+                def altered(writer, output):
+                    square = writer.pages[0]["/Annots"][-1].get_object()
+                    if mutation == "color":
+                        square[NameObject("/C")] = ArrayObject([FloatObject(0)] * 3)
+                    elif mutation == "width":
+                        square["/BS"][NameObject("/W")] = FloatObject(4)
+                    elif mutation == "flags":
+                        square[NameObject("/F")] = NumberObject(0)
+                    elif mutation == "appearance":
+                        square["/AP"]["/N"].get_object().set_data(b"q 0 0 m S Q\n")
+                    elif mutation == "interior":
+                        square[NameObject("/IC")] = ArrayObject([FloatObject(1)] * 3)
+                    else:
+                        square["/AP"]["/N"].get_object()[NameObject("/Matrix")] = ArrayObject(
+                            [FloatObject(1), FloatObject(0), FloatObject(0),
+                             FloatObject(1), FloatObject(0), FloatObject(0)])
+                    return original_write(writer, output)
+
+                with patch.object(PdfWriter, "write", altered):
+                    result = write_annotated_pdf(source, destination, (item,))
+                self.assertFalse(result.success)
+                self.assertFalse(destination.exists())
 
     def test_quadpoints_appearance_renders_on_expected_crop_and_rotations(self):
         expected_regions = {

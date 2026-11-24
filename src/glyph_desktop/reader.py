@@ -22,7 +22,8 @@ from .search import DocumentSearch
 from .find_bar import FindBar
 from .outline import OutlineDestination, OutlinePanel
 from .links import PdfLinks
-from .annotations import Annotations, NOTE_MARKER_SIZE
+from .annotations import (Annotations, NOTE_MARKER_SIZE, RECTANGLE_COLOR,
+                          RECTANGLE_HIT_TOLERANCE, RECTANGLE_WIDTH)
 from .note_editor import NoteEditor
 from .pdf_writer import capture_source_snapshot, verify_source_snapshot
 
@@ -220,9 +221,15 @@ class ContinuousPageView(QAbstractScrollArea):
         self._move_gesture: _AnnotationMove | None = None
         self._ink_mode = False
         self._note_mode = False
+        self._rectangle_mode = False
         self._ink_page = None
         self._ink_generation = None
         self._ink_points: list[tuple[float, float]] = []
+        self._rectangle_page = None
+        self._rectangle_generation = None
+        self._rectangle_start = None
+        self._rectangle_end = None
+        self._rectangle_press_position = None
         self._escape_latch = False
         self._drag_timer = QTimer(self, singleShot=True)
         self._drag_timer.setInterval(16)
@@ -254,6 +261,7 @@ class ContinuousPageView(QAbstractScrollArea):
         self._annotation_press = None
         self.set_ink_mode(False)
         self.set_note_mode(False)
+        self.set_rectangle_mode(False)
         self._escape_latch = False
         self._drag_timer.stop()
         self._drag_page = self._drag_start = self._drag_end = None
@@ -429,13 +437,12 @@ class ContinuousPageView(QAbstractScrollArea):
         if self._move_gesture is not None and self._move_gesture.active:
             self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
             return
-        if self._ink_mode or self._note_mode:
+        if self._ink_mode or self._note_mode or self._rectangle_mode:
             self.viewport().setCursor(Qt.CursorShape.CrossCursor)
             return
         hit = self.viewport_to_pdf(position)
-        annotation = (self.reader.annotations.at(*hit, note_radius=self._note_radius())
-                      if hit else None)
-        if annotation is not None and annotation.kind in ("note", "ink"):
+        annotation = self._annotation_at(hit)
+        if annotation is not None and annotation.kind in ("note", "ink", "rectangle"):
             self.viewport().setCursor(Qt.CursorShape.OpenHandCursor)
             return
         link = self._link_at(position)
@@ -447,7 +454,7 @@ class ContinuousPageView(QAbstractScrollArea):
         if self._move_gesture is not None and self._move_gesture.active:
             shape = Qt.CursorShape.ClosedHandCursor
         else:
-            shape = (Qt.CursorShape.CrossCursor if self._ink_mode or self._note_mode
+            shape = (Qt.CursorShape.CrossCursor if self._ink_mode or self._note_mode or self._rectangle_mode
                      else Qt.CursorShape.ArrowCursor)
         self.viewport().setCursor(shape)
 
@@ -458,6 +465,14 @@ class ContinuousPageView(QAbstractScrollArea):
     @property
     def note_mode(self) -> bool:
         return self._note_mode
+
+    @property
+    def rectangle_mode(self) -> bool:
+        return self._rectangle_mode
+
+    @property
+    def rectangle_drawing(self) -> bool:
+        return self._rectangle_page is not None
 
     @property
     def ink_drawing(self) -> bool:
@@ -476,6 +491,29 @@ class ContinuousPageView(QAbstractScrollArea):
         self._drag_timer.stop()
         self._drag_page = self._drag_start = self._drag_end = None
         self.viewport().update()
+
+    def cancel_rectangle_drawing(self) -> None:
+        """Discard the current rectangle preview without changing tool mode."""
+        if not self.rectangle_drawing:
+            return
+        self._rectangle_page = self._rectangle_generation = None
+        self._rectangle_start = self._rectangle_end = None
+        self._rectangle_press_position = None
+        self.viewport().update()
+
+    def handle_rectangle_escape(self, event) -> bool:
+        """Consume Escape for a live rectangle draft before window-level handlers."""
+        if (event.type() != QEvent.Type.KeyPress
+                or event.key() != Qt.Key.Key_Escape
+                or event.modifiers() != Qt.KeyboardModifier.NoModifier):
+            return False
+        if self._escape_latch:
+            return True
+        if event.isAutoRepeat() or not self.rectangle_drawing:
+            return False
+        self._escape_latch = True
+        self.cancel_rectangle_drawing()
+        return True
 
     def _update_annotation_move(self, position) -> None:
         move = self._move_gesture
@@ -505,10 +543,23 @@ class ContinuousPageView(QAbstractScrollArea):
         """Half-edge of the fixed-size note marker converted into PDF-page units."""
         return NOTE_MARKER_SIZE / 2 / max(0.001, self.zoom_scale)
 
+    def _annotation_at(self, hit):
+        if not hit:
+            return None
+        return self.reader.annotations.at(
+            *hit, note_radius=self._note_radius(),
+            rectangle_tolerance=RECTANGLE_HIT_TOLERANCE / max(0.001, self.zoom_scale))
+
+    def _clamped_rectangle_point(self, page, point):
+        width, height = self.page_sizes[page]
+        return QPointF(min(max(point.x(), 0.0), width),
+                       min(max(point.y(), 0.0), height))
+
     def set_ink_mode(self, enabled: bool) -> None:
         enabled = bool(enabled)
         if enabled:
             self.cancel_annotation_move()
+            self.set_rectangle_mode(False)
         if enabled and self._note_mode:
             self.set_note_mode(False)
         self._ink_mode = enabled
@@ -522,11 +573,77 @@ class ContinuousPageView(QAbstractScrollArea):
         enabled = bool(enabled)
         if enabled:
             self.cancel_annotation_move()
+            self.set_rectangle_mode(False)
         if enabled and self._ink_mode:
             self.set_ink_mode(False)
         self._note_mode = enabled
         self.reader.note_action.setChecked(enabled)
         self._rest_cursor()
+
+    def set_rectangle_mode(self, enabled: bool) -> None:
+        """Enter or leave Rectangle drawing mode, keeping tool actions exclusive."""
+        enabled = bool(enabled)
+        if enabled:
+            self.cancel_annotation_move()
+            if self._ink_mode:
+                self.set_ink_mode(False)
+            if self._note_mode:
+                self.set_note_mode(False)
+            self.reader.selection.clear()
+            self.reader.annotations.select(None, self.reader.document.generation)
+            self.setFocus(Qt.FocusReason.OtherFocusReason)
+        else:
+            self.cancel_rectangle_drawing()
+        self._rectangle_mode = enabled
+        self.reader.rectangle_action.setChecked(enabled)
+        self._rest_cursor()
+
+    def _begin_rectangle_drawing(self, position) -> None:
+        self._link_press = self._link_press_position = None
+        self._annotation_press = None
+        self._move_gesture = None
+        self._drag_timer.stop()
+        self._drag_page = self._drag_start = self._drag_end = None
+        self.reader.selection.clear()
+        self.reader.annotations.select(None, self.reader.document.generation)
+        hit = self.viewport_to_pdf(position)
+        if not hit:
+            return
+        self._rectangle_page = hit[0]
+        self._rectangle_generation = self.reader.document.generation
+        self._rectangle_start = self._clamped_rectangle_point(hit[0], hit[1])
+        self._rectangle_end = QPointF(self._rectangle_start)
+        self._rectangle_press_position = QPointF(position)
+        self.viewport().update()
+
+    def _update_rectangle_drawing(self, position) -> None:
+        if not self.rectangle_drawing:
+            return
+        if self._rectangle_generation != self.reader.document.generation:
+            self.cancel_rectangle_drawing()
+            return
+        hit = self.viewport_to_pdf(position, self._rectangle_page, clamp=True)
+        if hit:
+            self._rectangle_end = self._clamped_rectangle_point(self._rectangle_page, hit[1])
+            self.viewport().update()
+
+    def _finish_rectangle_drawing(self, position) -> None:
+        if not self.rectangle_drawing:
+            return
+        page = self._rectangle_page
+        generation = self._rectangle_generation
+        start = self._rectangle_start
+        press = self._rectangle_press_position
+        self._update_rectangle_drawing(position)
+        end = self._rectangle_end
+        distance = ((QPointF(position) - press).manhattanLength()
+                    if press is not None else 0.0)
+        self.cancel_rectangle_drawing()
+        if (generation == self.reader.document.generation
+                and distance >= QApplication.startDragDistance()
+                and start is not None and end is not None):
+            self.reader.annotations.add_rectangle(
+                page, (start.x(), start.y(), end.x(), end.y()))
 
     def _begin_ink_stroke(self, position) -> None:
         self._link_press = self._link_press_position = None
@@ -584,11 +701,15 @@ class ContinuousPageView(QAbstractScrollArea):
                 event.accept()
                 return
             hit = self.viewport_to_pdf(event.position())
-            annotation = (self.reader.annotations.at(*hit, note_radius=self._note_radius())
+            if self._rectangle_mode:
+                self._begin_rectangle_drawing(event.position())
+                event.accept()
+                return
+            annotation = (self._annotation_at(hit)
                           if hit and event.modifiers() in
                           (Qt.KeyboardModifier.NoModifier, Qt.KeyboardModifier.AltModifier) else None)
             movable_annotation = (annotation if annotation is not None
-                                  and annotation.kind in ("note", "ink")
+                                  and annotation.kind in ("note", "ink", "rectangle")
                                   and event.modifiers() == Qt.KeyboardModifier.NoModifier
                                   else None)
             self._link_press = (self._link_at(event.position()) if
@@ -618,6 +739,10 @@ class ContinuousPageView(QAbstractScrollArea):
     def mouseMoveEvent(self, event):
         if self._ink_page is not None and event.buttons() & Qt.MouseButton.LeftButton:
             self._append_ink_point(event.position())
+            event.accept()
+            return
+        if self._rectangle_mode and event.buttons() & Qt.MouseButton.LeftButton:
+            self._update_rectangle_drawing(event.position())
             event.accept()
             return
         if self._move_gesture is not None and event.buttons() & Qt.MouseButton.LeftButton:
@@ -654,6 +779,11 @@ class ContinuousPageView(QAbstractScrollArea):
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            if self.rectangle_drawing or self._rectangle_mode:
+                self._finish_rectangle_drawing(event.position())
+                self._rest_cursor()
+                event.accept()
+                return
             if self._ink_page is not None:
                 self._append_ink_point(event.position())
                 self._finish_ink_stroke()
@@ -690,8 +820,7 @@ class ContinuousPageView(QAbstractScrollArea):
                 event.accept()
                 return
             hit = self.viewport_to_pdf(event.position())
-            annotation = (self.reader.annotations.at(*hit, note_radius=self._note_radius())
-                          if hit else None)
+            annotation = self._annotation_at(hit)
             if (annotation_press and annotation and annotation.id == annotation_press[0]
                     and (event.position() - annotation_press[2]).manhattanLength()
                     < QApplication.startDragDistance()):
@@ -733,6 +862,9 @@ class ContinuousPageView(QAbstractScrollArea):
             if self._escape_latch or event.isAutoRepeat():
                 event.accept()
                 return
+            if self.handle_rectangle_escape(event):
+                event.accept()
+                return
             if self._move_gesture is not None:
                 self._escape_latch = True
                 self.cancel_annotation_move()
@@ -751,6 +883,11 @@ class ContinuousPageView(QAbstractScrollArea):
             if self._note_mode:
                 self._escape_latch = True
                 self.set_note_mode(False)
+                event.accept()
+                return
+            if self._rectangle_mode:
+                self._escape_latch = True
+                self.set_rectangle_mode(False)
                 event.accept()
                 return
         if event.modifiers() == Qt.KeyboardModifier.NoModifier and self.reader.annotations.selected_id:
@@ -776,6 +913,7 @@ class ContinuousPageView(QAbstractScrollArea):
     def focusOutEvent(self, event):
         self._escape_latch = False
         self.cancel_annotation_move()
+        self.cancel_rectangle_drawing()
         super().focusOutEvent(event)
 
     def selection_at(self, position):
@@ -796,8 +934,7 @@ class ContinuousPageView(QAbstractScrollArea):
             menu.exec(event.globalPos())
             return
         hit = self.viewport_to_pdf(event.pos())
-        note = (self.reader.annotations.at(*hit, note_radius=self._note_radius())
-                if hit else None)
+        note = self._annotation_at(hit)
         if note is not None and note.kind == "note":
             self.reader.annotations.select(note.id, self.reader.document.generation)
             menu = QMenu(self)
@@ -833,7 +970,11 @@ class ContinuousPageView(QAbstractScrollArea):
             selection_visible = selection.valid() and selection.page == page
             annotations = [item for item in self.reader.annotations.items
                            if item.page == page and item.generation == self.reader.document.generation]
-            if search_results or selection_visible or annotations:
+            rectangle_preview = (self._rectangle_page == page
+                                 and self._rectangle_generation == self.reader.document.generation
+                                 and self._rectangle_start is not None
+                                 and self._rectangle_end is not None)
+            if search_results or selection_visible or annotations or rectangle_preview:
                 width, height = self.page_sizes[page]
                 transform = QTransform().translate(rect.left(), rect.top()).scale(rect.width() / width, rect.height() / height)
                 for item in annotations:
@@ -882,6 +1023,20 @@ class ContinuousPageView(QAbstractScrollArea):
                             painter.drawRect(marker.adjusted(-2, -2, 2, 2))
                         painter.restore()
                         continue
+                    if item.kind == "rectangle":
+                        left, top, right, bottom = item.rect
+                        rectangle = transform.mapRect(
+                            QRectF(left + dx, top + dy, right - left, bottom - top))
+                        painter.setBrush(Qt.BrushStyle.NoBrush)
+                        painter.setPen(QPen(QColor(*RECTANGLE_COLOR),
+                                            RECTANGLE_WIDTH * transform.m11()))
+                        painter.drawRect(rectangle)
+                        if item.id == self.reader.annotations.selected_id:
+                            painter.setPen(QPen(QColor(70, 105, 160, 220), 1.5,
+                                                Qt.PenStyle.DashLine))
+                            painter.drawRect(rectangle.adjusted(-2, -2, 2, 2))
+                        painter.restore()
+                        continue
                     for region in item.regions:
                         polygon = transform.map(QPolygonF([QPointF(x, y) for x, y in region]))
                         bounds = polygon.boundingRect()
@@ -897,6 +1052,20 @@ class ContinuousPageView(QAbstractScrollArea):
                             painter.setBrush(Qt.BrushStyle.NoBrush)
                             painter.setPen(QPen(QColor(70, 105, 160, 200), 1, Qt.PenStyle.DashLine))
                             painter.drawPolygon(polygon)
+                    painter.restore()
+                if rectangle_preview:
+                    x1, y1 = self._rectangle_start.x(), self._rectangle_start.y()
+                    x2, y2 = self._rectangle_end.x(), self._rectangle_end.y()
+                    preview = transform.mapRect(QRectF(min(x1, x2), min(y1, y2),
+                                                       abs(x2 - x1), abs(y2 - y1)))
+                    color = QColor(*RECTANGLE_COLOR)
+                    color.setAlpha(190)
+                    painter.save()
+                    painter.setClipRect(rect, Qt.ClipOperation.IntersectClip)
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
+                    painter.setPen(QPen(color, RECTANGLE_WIDTH * transform.m11(),
+                                        Qt.PenStyle.DashLine))
+                    painter.drawRect(preview)
                     painter.restore()
                 if search_results:
                     painter.save()
@@ -1102,6 +1271,9 @@ class Reader(QWidget):
         self.note_action = QAction("&Note", self, checkable=True)
         self.note_action.triggered.connect(
             lambda checked: self.page_view.set_note_mode(checked))
+        self.rectangle_action = QAction("&Rectangle", self, checkable=True)
+        self.rectangle_action.triggered.connect(
+            lambda checked: self.page_view.set_rectangle_mode(checked))
         self.edit_note_action = QAction("Edit &Note", self)
         self.edit_note_action.setEnabled(False)
         self.edit_note_action.triggered.connect(self.edit_selected_note)
@@ -1154,6 +1326,9 @@ class Reader(QWidget):
     def eventFilter(self, watched, event):
         if watched is self.page_view.viewport() and event.type() == QEvent.Type.Leave:
             shape = (Qt.CursorShape.ClosedHandCursor if self.page_view.annotation_moving
+                     else Qt.CursorShape.CrossCursor if
+                     (self.page_view.ink_mode or self.page_view.note_mode
+                      or self.page_view.rectangle_mode)
                      else Qt.CursorShape.ArrowCursor)
             self.page_view.viewport().setCursor(shape)
         if (watched is self.page_view.viewport() and event.type() == QEvent.Type.Wheel
@@ -1325,6 +1500,9 @@ class Reader(QWidget):
         if self.page_view.ink_drawing:
             self.page_view.cancel_ink_stroke()
             return False
+        if self.page_view.rectangle_drawing:
+            self.page_view.cancel_rectangle_drawing()
+            return False
         if self.page_view.annotation_moving:
             self.page_view.cancel_annotation_move()
             return False
@@ -1334,6 +1512,9 @@ class Reader(QWidget):
         """Redo the newest reversed annotation mutation, or discard an unfinished stroke."""
         if self.page_view.ink_drawing:
             self.page_view.cancel_ink_stroke()
+            return False
+        if self.page_view.rectangle_drawing:
+            self.page_view.cancel_rectangle_drawing()
             return False
         if self.page_view.annotation_moving:
             self.page_view.cancel_annotation_move()
@@ -1413,6 +1594,7 @@ class Reader(QWidget):
         self.select_all_action.setEnabled(active)
         self.ink_action.setEnabled(active)
         self.note_action.setEnabled(active)
+        self.rectangle_action.setEnabled(active)
         if not active:
             self._reset_document_state()
         elif self._view_generation != self.document.generation:
