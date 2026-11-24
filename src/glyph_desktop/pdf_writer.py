@@ -11,6 +11,7 @@ from decimal import Decimal
 import ctypes
 import errno
 import hashlib
+import math
 import ntpath
 import os
 from pathlib import Path
@@ -27,7 +28,8 @@ from pypdf.generic import (ArrayObject, BooleanObject, ByteStringObject, Diction
 from PySide6.QtCore import QFile, QFileDevice, QIODevice
 from PySide6.QtPdf import QPdfDocument
 
-from .pdf_annotations import convert_annotation
+from .annotations import RECTANGLE_COLOR, RECTANGLE_WIDTH
+from .pdf_annotations import _square_appearance_content, convert_annotation
 from .pdf_geometry import PageGeometry
 
 
@@ -787,6 +789,8 @@ def _validate_output(source_reader, stream, expected):
             annotation = reference.get_object()
             name = annotation.get("/NM")
             if name in expected:
+                if str(annotation.get("/Subtype")) == "/Square":
+                    _verify_glyph_square(annotation, page)
                 key = str(name)
                 found.setdefault(key, []).append(_annotation_record(page_number, annotation))
     if set(found) != set(expected):
@@ -866,15 +870,121 @@ def _canonical_page_annotation(annotation, page):
         for key, value in annotation.items() if str(key) != "/P")))
 
 
+def _resolved_annotation_value(value):
+    return value.get_object() if isinstance(value, IndirectObject) else value
+
+
+def _verify_glyph_square(annotation, page):
+    """Accept only the exact native Square structure Glyph currently emits."""
+    required = {"/Type", "/Subtype", "/Rect", "/C", "/BS", "/AP",
+                "/CA", "/NM", "/F"}
+    keys = {str(key) for key in annotation}
+    if (not required.issubset(keys) or keys - required - {"/P"}
+            or str(annotation.get("/Type")) != "/Annot"
+            or str(annotation.get("/Subtype")) != "/Square"):
+        raise ValueError("Unsupported Glyph /Square annotation structure")
+    if "/P" in annotation:
+        page_ref = annotation.raw_get("/P")
+        if (not isinstance(page_ref, IndirectObject)
+                or page_ref != page.indirect_reference):
+            raise ValueError("Glyph /Square page reference cannot be verified")
+
+    try:
+        rect = tuple(float(value) for value in annotation["/Rect"])
+        color = tuple(float(value) for value in annotation["/C"])
+        opacity = float(annotation["/CA"])
+        name = annotation["/NM"]
+    except (KeyError, TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Unsupported Glyph /Square annotation values") from error
+    numeric = (NumberObject, FloatObject)
+    rect_values, color_values = annotation["/Rect"], annotation["/C"]
+    if (len(rect) != 4 or not all(math.isfinite(value) for value in rect)
+            or rect[0] >= rect[2] or rect[1] >= rect[3]
+            or not isinstance(rect_values, ArrayObject)
+            or not all(isinstance(value, numeric) for value in rect_values)):
+        raise ValueError("Unsupported Glyph /Square geometry")
+    if (len(color) != 3 or not all(math.isfinite(value) and 0 <= value <= 1
+                                   for value in color)
+            or not isinstance(color_values, ArrayObject)
+            or not all(isinstance(value, numeric) for value in color_values)
+            or not _same_numbers(color, tuple(channel / 255 for channel in RECTANGLE_COLOR))):
+        raise ValueError("Unsupported Glyph /Square color")
+    flags_value = annotation["/F"]
+    opacity_value = annotation["/CA"]
+    if (not isinstance(flags_value, NumberObject) or int(flags_value) != 4
+            or not isinstance(opacity_value, numeric) or not _same_number(opacity, 1.0)):
+        raise ValueError("Unsupported Glyph /Square visibility flags")
+    if not isinstance(name, TextStringObject) or not str(name):
+        raise ValueError("Unsupported Glyph /Square identity")
+
+    media = _page_box(page, "/MediaBox")
+    crop = _page_box(page, "/CropBox")
+    visible = (max(media[0], crop[0]), max(media[1], crop[1]),
+               min(media[2], crop[2]), min(media[3], crop[3]))
+    tolerance = 0.001
+    if (rect[0] < visible[0] - tolerance or rect[1] < visible[1] - tolerance
+            or rect[2] > visible[2] + tolerance or rect[3] > visible[3] + tolerance):
+        raise ValueError("Unsupported Glyph /Square page geometry")
+
+    border = _resolved_annotation_value(annotation["/BS"])
+    if (not isinstance(border, DictionaryObject)
+            or {str(key) for key in border} != {"/Type", "/W", "/S"}
+            or str(border.get("/Type")) != "/Border"
+            or str(border.get("/S")) != "/S"
+            or not isinstance(border.get("/W"), numeric)
+            or not _same_number(border.get("/W", -1), RECTANGLE_WIDTH)):
+        raise ValueError("Unsupported Glyph /Square border")
+
+    appearance = _resolved_annotation_value(annotation["/AP"])
+    if (not isinstance(appearance, DictionaryObject)
+            or {str(key) for key in appearance} != {"/N"}):
+        raise ValueError("Unsupported Glyph /Square appearance dictionary")
+    normal = _resolved_annotation_value(appearance["/N"])
+    expected_form_keys = {"/Type", "/Subtype", "/FormType", "/BBox", "/Resources"}
+    try:
+        form_type_value = normal.get("/FormType") if isinstance(normal, DictionaryObject) else None
+    except (TypeError, ValueError, OverflowError):
+        form_type_value = None
+    normal_keys = {str(key) for key in normal} if isinstance(normal, DictionaryObject) else set()
+    if (not isinstance(normal, StreamObject)
+            or not expected_form_keys.issubset(normal_keys)
+            or normal_keys - expected_form_keys - {"/Length", "/Filter", "/DecodeParms"}
+            or str(normal.get("/Type")) != "/XObject"
+            or str(normal.get("/Subtype")) != "/Form"
+            or not isinstance(form_type_value, NumberObject)
+            or int(form_type_value) != 1):
+        raise ValueError("Unsupported Glyph /Square appearance form")
+    bbox = normal.get("/BBox")
+    resources = _resolved_annotation_value(normal.get("/Resources"))
+    expected_bbox = (0.0, 0.0, rect[2] - rect[0], rect[3] - rect[1])
+    try:
+        bbox_values = tuple(float(value) for value in bbox) if isinstance(bbox, ArrayObject) else ()
+    except (TypeError, ValueError, OverflowError):
+        bbox_values = ()
+    if (not isinstance(bbox, ArrayObject)
+            or not all(isinstance(value, numeric) for value in bbox)
+            or not _same_numbers(bbox_values, expected_bbox)
+            or not isinstance(resources, DictionaryObject) or len(resources)):
+        raise ValueError("Unsupported Glyph /Square appearance bounds")
+    try:
+        expected_data = _square_appearance_content(rect, RECTANGLE_COLOR, RECTANGLE_WIDTH)
+        if normal.get_data() != expected_data:
+            raise ValueError("Unsupported Glyph /Square appearance data")
+    except (KeyError, TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Unsupported Glyph /Square appearance data") from error
+
+
 def _inherited_annotations(reader):
     pages = []
-    supported = {"/Ink", "/Text", "/Highlight", "/Underline", "/StrikeOut"}
+    supported = {"/Ink", "/Text", "/Highlight", "/Underline", "/StrikeOut", "/Square"}
     for page in reader.pages:
         records = []
         for reference in page.get("/Annots", []):
             annotation = reference.get_object()
             if not isinstance(annotation, DictionaryObject) or str(annotation.get("/Subtype")) not in supported:
                 raise ValueError("Unsupported inherited annotation cannot be verified")
+            if str(annotation.get("/Subtype")) == "/Square":
+                _verify_glyph_square(annotation, page)
             records.append(_canonical_page_annotation(annotation, page))
         pages.append(Counter(records))
     return pages

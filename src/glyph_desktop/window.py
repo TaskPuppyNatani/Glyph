@@ -63,6 +63,7 @@ class MainWindow(QMainWindow):
         for action in self.reader.markup_actions.values():
             annotations.addAction(action)
         annotations.addAction(self.reader.ink_action)
+        annotations.addAction(self.reader.rectangle_action)
         annotations.addAction(self.reader.note_action)
         annotations.addAction(self.reader.edit_note_action)
         self.stack.addWidget(self.reader)
@@ -504,6 +505,11 @@ class MainWindow(QMainWindow):
             if event.type() == QEvent.Type.Drop:
                 self.dropEvent(event)
                 return True
+        if (event.type() == QEvent.Type.KeyPress and self.isActiveWindow()
+                and QApplication.activePopupWidget() is None
+                and self.reader.page_view.rectangle_mode
+                and self.reader.page_view.handle_rectangle_escape(event)):
+            return True
         if (event.type() == QEvent.Type.KeyPress and self.isActiveWindow()
                 and QApplication.activePopupWidget() is None
                 and event.key() == Qt.Key.Key_Escape

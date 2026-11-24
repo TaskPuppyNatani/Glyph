@@ -1,4 +1,4 @@
-"""In-memory, document-scoped annotations (text markup, freehand ink, and sticky notes)
+"""In-memory, document-scoped annotations (text markup, rectangles, freehand ink, and sticky notes)
 in PDF page coordinates, with a bounded undo/redo history over their mutations."""
 
 import math
@@ -44,6 +44,15 @@ class Note:
 
 
 @dataclass(frozen=True)
+class Rectangle:
+    id: str
+    kind: str
+    page: int
+    generation: int
+    rect: tuple[float, float, float, float]
+
+
+@dataclass(frozen=True)
 class AnnotationSessionSnapshot:
     """Value-only recovery state for one open document."""
     path: Path
@@ -58,6 +67,9 @@ class AnnotationSessionSnapshot:
 INK_WIDTH = 2.5
 INK_MIN_LENGTH = 4.0
 INK_HIT_TOLERANCE = 6.0
+RECTANGLE_COLOR = (200, 52, 66)
+RECTANGLE_WIDTH = 2.5
+RECTANGLE_HIT_TOLERANCE = 4.0
 # Marker edge in viewport pixels: sizing only, never stored as annotation data.
 NOTE_MARKER_SIZE = 18.0
 
@@ -82,6 +94,32 @@ def near_polyline(points, point, tolerance):
         if math.hypot(ax + along * dx - x, ay + along * dy - y) <= tolerance:
             return True
     return False
+
+
+def _normalize_rectangle(rect):
+    """Return a finite, nondegenerate rectangle ordered left/top/right/bottom."""
+    if type(rect) not in (tuple, list) or len(rect) != 4:
+        return None
+    if any(isinstance(value, bool) or not isinstance(value, (int, float))
+           for value in rect):
+        return None
+    try:
+        values = tuple(float(value) for value in rect)
+    except (OverflowError, ValueError):
+        return None
+    if not all(math.isfinite(value) for value in values):
+        return None
+    left, right = sorted((values[0], values[2]))
+    top, bottom = sorted((values[1], values[3]))
+    if left >= right or top >= bottom:
+        return None
+    return left, top, right, bottom
+
+
+def _rectangle_outline(rect):
+    left, top, right, bottom = rect
+    return ((left, top), (right, top), (right, bottom),
+            (left, bottom), (left, top))
 
 
 class Annotations(QObject):
@@ -136,9 +174,19 @@ class Annotations(QObject):
         generation = self.document.generation
 
         def rebind(item):
-            if (type(item) not in (Markup, Ink, Note) or item.generation != snapshot.generation
+            if (type(item) not in (Markup, Ink, Note, Rectangle) or item.generation != snapshot.generation
                     or type(item.page) is not int or not 0 <= item.page < self.document.count):
                 raise ValueError("Snapshot contains an incompatible annotation")
+            if type(item) is Rectangle:
+                normalized = _normalize_rectangle(item.rect)
+                if (item.kind != "rectangle" or not isinstance(item.id, str) or not item.id
+                        or type(item.rect) is not tuple or normalized is None
+                        or item.rect != normalized):
+                    raise ValueError("Snapshot contains an invalid rectangle")
+                width, height = self.document.page_sizes[item.page]
+                if (normalized[0] < 0 or normalized[1] < 0
+                        or normalized[2] > width or normalized[3] > height):
+                    raise ValueError("Snapshot rectangle lies outside its page")
             return replace(item, generation=generation)
 
         def rebind_operation(operation):
@@ -240,6 +288,24 @@ class Annotations(QObject):
         self.changed.emit()
         return item
 
+    def add_rectangle(self, page, rect):
+        """Create one normalized, page-bounded Rectangle from PDF-page coordinates."""
+        if type(page) is not int or not 0 <= page < self.document.count:
+            return None
+        normalized = _normalize_rectangle(rect)
+        if normalized is None:
+            return None
+        width, height = self.document.page_sizes[page]
+        if (normalized[0] < 0 or normalized[1] < 0
+                or normalized[2] > width or normalized[3] > height):
+            return None
+        item = Rectangle(uuid4().hex, "rectangle", page, self.document.generation, normalized)
+        self._items.append(item)
+        self.selected_id = None
+        self.history.record(CREATE, item, len(self._items) - 1)
+        self.changed.emit()
+        return item
+
     def add_note(self, page, anchor, text):
         """Create one Note from plain PDF-page values; blank text creates nothing."""
         if not 0 <= page < self.document.count:
@@ -274,13 +340,14 @@ class Annotations(QObject):
         return item
 
     def bounded_move_delta(self, item, dx, dy):
-        """Return one same-page PDF translation that keeps a Note or Ink in bounds."""
-        if (not isinstance(item, (Note, Ink)) or item.generation != self.document.generation
+        """Return one same-page PDF translation that keeps an annotation in bounds."""
+        if (not isinstance(item, (Note, Ink, Rectangle)) or item.generation != self.document.generation
                 or not math.isfinite(dx) or not math.isfinite(dy)):
             return None
         if isinstance(item, Ink) and not item.points:
             return None
-        geometry = (item.anchor if isinstance(item, Note) else
+        geometry = (item.anchor if isinstance(item, Note) else item.rect
+                    if isinstance(item, Rectangle) else
                     tuple(value for point in item.points for value in point))
         if not all(math.isfinite(value) for value in geometry):
             return None
@@ -293,6 +360,12 @@ class Annotations(QObject):
             x = min(max(item.anchor[0] + dx, 0.0), width)
             y = min(max(item.anchor[1] + dy, 0.0), height)
             return x - item.anchor[0], y - item.anchor[1]
+        if isinstance(item, Rectangle):
+            left, top, right, bottom = item.rect
+            if left < 0 or top < 0 or right > width or bottom > height:
+                return None
+            return (min(max(dx, -left), width - right),
+                    min(max(dy, -top), height - bottom))
         xs = [point[0] for point in item.points]
         ys = [point[1] for point in item.points]
         if not math.isfinite(item.width):
@@ -306,7 +379,7 @@ class Annotations(QObject):
 
     def move(self, item, dx, dy):
         """Commit one bounded rigid movement as an ordinary immutable UPDATE."""
-        if not isinstance(item, (Note, Ink)):
+        if not isinstance(item, (Note, Ink, Rectangle)):
             return None
         index = self._index_of(item.id)
         if index < 0 or self._items[index] != item:
@@ -319,6 +392,10 @@ class Annotations(QObject):
         if isinstance(previous, Note):
             updated = replace(previous, anchor=(previous.anchor[0] + dx,
                                                 previous.anchor[1] + dy))
+        elif isinstance(previous, Rectangle):
+            left, top, right, bottom = previous.rect
+            updated = replace(previous, rect=(left + dx, top + dy,
+                                              right + dx, bottom + dy))
         elif isinstance(previous, Ink):
             updated = replace(previous, points=tuple((x + dx, y + dy)
                                                      for x, y in previous.points))
@@ -331,7 +408,8 @@ class Annotations(QObject):
         self.changed.emit()
         return updated
 
-    def at(self, page, point, note_radius=NOTE_MARKER_SIZE / 2):
+    def at(self, page, point, note_radius=NOTE_MARKER_SIZE / 2,
+           rectangle_tolerance=RECTANGLE_HIT_TOLERANCE):
         for item in reversed(self._items):
             if item.generation != self.document.generation or item.page != page:
                 continue
@@ -341,6 +419,10 @@ class Annotations(QObject):
             elif item.kind == "note":
                 if (abs(point.x() - item.anchor[0]) <= note_radius
                         and abs(point.y() - item.anchor[1]) <= note_radius):
+                    return item
+            elif item.kind == "rectangle":
+                if near_polyline(_rectangle_outline(item.rect), point,
+                                 rectangle_tolerance + RECTANGLE_WIDTH / 2):
                     return item
             elif any(QPolygonF([QPointF(x, y) for x, y in region]).containsPoint(
                     point, Qt.FillRule.OddEvenFill) for region in item.regions):

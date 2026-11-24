@@ -8,7 +8,8 @@ from pypdf.generic import (ArrayObject, DecodedStreamObject, DictionaryObject,
                            FloatObject, NameObject, NumberObject, RectangleObject,
                            TextStringObject)
 
-from .annotations import Ink, Markup, Note
+from .annotations import (Ink, Markup, Note, Rectangle, RECTANGLE_COLOR,
+                          RECTANGLE_WIDTH)
 from .pdf_geometry import GeometryError, PageGeometry
 
 
@@ -78,6 +79,42 @@ def _markup_appearance(kind, quads, rect, color, width):
     return DictionaryObject({NameObject("/N"): appearance})
 
 
+def _square_appearance_content(rect, color, width):
+    """Build the constrained vector appearance used by Glyph /Square records."""
+    left, bottom, right, top = (
+        float(FloatObject(value).myrepr()) for value in rect)
+    rect_width, rect_height = right - left, top - bottom
+    stroke = float(FloatObject(width).myrepr())
+    inset_x = min(stroke / 2, rect_width / 2)
+    inset_y = min(stroke / 2, rect_height / 2)
+    content = ["q", " ".join(_pdf_number(channel / 255) for channel in color) + " RG",
+               f"{_pdf_number(stroke)} w",
+               f"{_pdf_number(inset_x)} {_pdf_number(inset_y)} m",
+               f"{_pdf_number(rect_width - inset_x)} {_pdf_number(inset_y)} l",
+               f"{_pdf_number(rect_width - inset_x)} {_pdf_number(rect_height - inset_y)} l",
+               f"{_pdf_number(inset_x)} {_pdf_number(rect_height - inset_y)} l",
+               "h S", "Q"]
+    return ("\n".join(content) + "\n").encode("ascii")
+
+
+def _square_appearance(rect, color, width):
+    left, bottom, right, top = rect
+    # Match the serialized /Rect precision so inherited validation can
+    # reconstruct the same local appearance after reopening the PDF.
+    serialized = tuple(float(FloatObject(value).myrepr())
+                       for value in (left, bottom, right, top))
+    rect_width = serialized[2] - serialized[0]
+    rect_height = serialized[3] - serialized[1]
+    appearance = DecodedStreamObject()
+    appearance.set_data(_square_appearance_content(rect, color, width))
+    appearance[NameObject("/Type")] = NameObject("/XObject")
+    appearance[NameObject("/Subtype")] = NameObject("/Form")
+    appearance[NameObject("/FormType")] = NumberObject(1)
+    appearance[NameObject("/BBox")] = RectangleObject((0, 0, rect_width, rect_height))
+    appearance[NameObject("/Resources")] = DictionaryObject()
+    return DictionaryObject({NameObject("/N"): appearance})
+
+
 def convert_annotation(item, geometry: PageGeometry):
     """Return a PDF annotation; note dates reflect export, not original creation."""
     if isinstance(item, Note) and item.kind == "note":
@@ -139,6 +176,30 @@ def convert_annotation(item, geometry: PageGeometry):
             NameObject("/InkList"): ArrayObject([_numbers(value for point in points for value in point)]),
             NameObject("/BS"): _border(width),
             NameObject("/C"): _color((24, 32, 44)),
+        })
+        return _set_common(annotation, item.id)
+
+    if isinstance(item, Rectangle) and item.kind == "rectangle":
+        if (type(item.rect) not in (tuple, list) or len(item.rect) != 4
+                or any(isinstance(value, bool) or not isinstance(value, (int, float))
+                       for value in item.rect)):
+            raise GeometryError("Rectangle annotations must contain four coordinates")
+        left, top, right, bottom = (
+            float(value) for value in item.rect)
+        if not all(math.isfinite(value) for value in (left, top, right, bottom)):
+            raise GeometryError("Rectangle geometry must be finite")
+        if (left < 0 or top < 0 or right > geometry.qt_width
+                or bottom > geometry.qt_height or left >= right or top >= bottom):
+            raise GeometryError("Rectangle geometry must have positive area within its page")
+        rect = geometry.qt_rect_to_pdf((left, top, right - left, bottom - top))
+        annotation = DictionaryObject({
+            NameObject("/Type"): NameObject("/Annot"),
+            NameObject("/Subtype"): NameObject("/Square"),
+            NameObject("/Rect"): _numbers(rect),
+            NameObject("/C"): _color(RECTANGLE_COLOR),
+            NameObject("/BS"): _border(RECTANGLE_WIDTH),
+            NameObject("/AP"): _square_appearance(rect, RECTANGLE_COLOR,
+                                                     RECTANGLE_WIDTH),
         })
         return _set_common(annotation, item.id)
 
