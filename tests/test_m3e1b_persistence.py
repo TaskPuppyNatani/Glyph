@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
 
@@ -361,9 +362,15 @@ class PersistenceFoundationTests(unittest.TestCase):
         self.assertTrue(result.success, result.error)
 
         with stage_annotated_pdf(first, (), validate_inherited=True) as staged:
+            retained_stream = staged._stream
+            stream_position = retained_stream.tell()
+            staged_reader = PdfReader(BytesIO(staged.read_bytes()), strict=True)
             saved = [reference.get_object() for reference in
-                     PdfReader(staged.path, strict=True).pages[0]["/Annots"]
+                     staged_reader.pages[0]["/Annots"]
                      if str(reference.get_object().get("/NM", "")) == item.id]
+            self.assertIs(staged._stream, retained_stream)
+            self.assertFalse(retained_stream.closed)
+            self.assertEqual(retained_stream.tell(), stream_position)
             self.assertEqual(len(saved), 1)
             self.assertEqual(str(saved[0]["/Subtype"]), "/Square")
 
